@@ -35,6 +35,7 @@ Two things first, because they explain a surprising share of reports:
 | Two consumer spans per queue message | `boto3sqs` instrumentation is active *and* a manual consumer span exists | `tracing/queue_messaging.md` |
 | Doubled token counts and cost | Two generation-capture paths: this skill's callback plus a Langfuse `CallbackHandler`, OpenInference, or a LiteLLM gateway | `tracing/genai/langchain/architecture.md`, "Do not double-instrument" |
 | Forty spans for a health check | An instrumentation package is too chatty — usually `botocore` or `urllib3` | `setup/auto_instrumentation.md` |
+| Trace size grows with rows or candidates and database scopes dominate | ORM or driver instrumentation emits connection and statement spans for every physical operation; the retained boundary may be too low-level for the current operational goal | `setup/high_volume_database_tracing.md` |
 | Metric series count grows under steady traffic | A high-cardinality label slipped in | `conventions/naming.md` |
 
 ## The trace has the wrong shape

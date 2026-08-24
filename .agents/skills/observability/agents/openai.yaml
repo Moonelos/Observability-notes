@@ -8,4 +8,4 @@
 interface:
   display_name: "Observability"
   short_description: "Instrument and repair OpenTelemetry services"
-  default_prompt: "Use $observability to instrument or repair this service with production-ready OpenTelemetry."
+  default_prompt: "Use $observability to build or repair low-noise, business-aligned OpenTelemetry with explicit boundary ownership."

@@ -1,6 +1,6 @@
 # Auto-Instrumentation: What to Install, What to Leave Off
 
-Auto-instrumentation gives you the boundaries a framework already knows about — HTTP server, HTTP client, database, cache. It cannot know your business operations. In particular, SQL instrumentation can see an `INSERT`, `UPDATE`, or `SELECT`, but cannot know that a row schedules or resumes durable work; that handoff needs the explicit boundary in `../tracing/durable_work.md`. Both layers are needed; neither replaces the other.
+Auto-instrumentation gives you the boundaries a framework already knows about — HTTP server, HTTP client, database, cache. It cannot know your business operations. In particular, SQL instrumentation can see an `INSERT`, `UPDATE`, or `SELECT`, but cannot know that a row schedules or resumes durable work; that handoff needs the explicit boundary in `../tracing/durable_work.md`. Dependency and business instrumentation answer different questions. Retain each layer only when its incident value justifies its volume; neither automatically substitutes for the other.
 
 Evaluate the package set **per service**. A worker and an API in the same repo should not automatically get the same list.
 
@@ -40,6 +40,14 @@ process never activates them.
 
 ## What to deliberately leave off
 
+### High-volume database and ORM tracing
+
+Database instrumentation is optional when its physical connection and statement spans overwhelm the
+business trace. Before enabling, retaining, disabling, or replacing it for a high-volume workload,
+read [high_volume_database_tracing.md](high_volume_database_tracing.md). It owns the evidence test,
+replacement contract, diagnostic-mode option, logging requirements, and verification checks. Do not
+replace noisy automatic spans with equally noisy manual repository spans or per-query logs.
+
 **Low-level AWS SDK tracing.** `opentelemetry-instrumentation-botocore` spans every `botocore` API call. In a service that lists objects, reads parameters, and refreshes credentials, that is thousands of spans that explain nothing, and it drowns the handful of spans that do. Leave it off unless a specific AWS call is a latency or failure suspect.
 
 Same reasoning for:
@@ -78,8 +86,9 @@ state, so write down which of the three you chose.
 
 ```
 HTTP request        queue publish       LLM call
-database query      queue consume       tool call
-external API call   scheduled job run   agent invocation
+external API call   queue consume       tool call
+business phase      scheduled job run   agent invocation
+database query — only when its query-level value earns the volume
 ```
 
 ---
