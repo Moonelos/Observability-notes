@@ -6,8 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import asdict, dataclass
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
-
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 
 SECONDS_PER_DAY = Decimal(86_400)
 

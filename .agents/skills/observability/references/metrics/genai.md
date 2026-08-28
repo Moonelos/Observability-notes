@@ -387,7 +387,7 @@ If quality scores are exported as metrics, publish the sample count next to ever
 - No metric carries a conversation ID, user ID, or response ID.
 - Series count stays flat under sustained load.
 
-Dashboards and alert design build on these — see the repo's `architecture/02_metrics_design_cheatsheet.md` for starter dashboards and burn-rate alerts.
+When the target repository contains architecture/02_metrics_design_cheatsheet.md, use its starter dashboards and burn-rate alerts to build on these metrics.
 
 ---
 

@@ -42,7 +42,7 @@ Three things happen when an operation fails:
 
 1. the span ends with `ERROR` status;
 2. the span carries a low-cardinality `error.type`;
-3. the exception detail — message, stack trace — is emitted once, as a named structured log, while the span is still active.
+3. the environment-appropriate exception detail is emitted once, as a named structured log, while the span is still active.
 
 Nothing else. No `str(exc)` in the span status message, no exception message as an attribute, no duplicated log at every call depth.
 
@@ -109,7 +109,7 @@ def fetch_price(sku: str) -> Decimal | None:
         except TimeoutError as exc:
             span.set_status(Status(StatusCode.ERROR))
             span.set_attribute("error.type", type(exc).__name__)
-            # This is the owning boundary, so it emits the exception detail.
+            # The shared logging processor applies the environment detail policy.
             log.error(
                 "price_fetch_failed",
                 otel_event_name="app.pricing.fetch.failed",
@@ -191,7 +191,7 @@ design.
 
 ## Where the exception log goes
 
-Emit it at the boundary that decides the request's outcome: the HTTP exception handler, the worker's per-message handler, the job's top-level `try`. That is one record per failed operation with a full stack trace, correlated by `trace_id`/`span_id` to every span in the trace.
+Emit it at the boundary that decides the request's outcome: the HTTP exception handler, the worker's per-message handler, the job's top-level `try`. That is one record per failed operation with environment-appropriate exception detail, correlated by `trace_id`/`span_id` to every span in the trace.
 
 The structlog processor that turns these into named OpenTelemetry events, and the duplicate-ingestion guard it needs, are in `../logging/structlog.md`.
 
@@ -214,6 +214,15 @@ Log severity and span status are independent fields. `logger.error(...)` does no
 
 Set both, deliberately, at the boundary that knows the operation failed.
 
+### Define an errored trace from span status
+
+OpenTelemetry has span status, not trace status. Here an errored trace means any
+trace containing an `ERROR` span; backend filters and tail sampling must match
+any span, not only the root. Successful fallback, expected business HITL, and
+safe deferral keep unset status plus their bounded outcome. Terminal
+failure-driven HITL carries `ERROR`, bounded `error.type`, and `app.outcome=hitl`.
+Log detail once while the owning span is active for correlation. Retain complete error traces; sample critical non-errors with a bounded-outcome policy.
+
 ---
 
 ## Checklist
@@ -224,6 +233,8 @@ Set both, deliberately, at the boundary that knows the operation failed.
 - [ ] `error.type="_NONE"` appears on `app.*` instruments and on no standard one.
 - [ ] The trace backend can reach the exception log record from the span, and the Collector's logs pipeline does not delete `exception.stacktrace`.
 - [ ] Caught-and-handled failures set span status explicitly, and only when the operation actually failed.
-- [ ] Exception detail is logged once, at the owning boundary, with `exc_info=True`.
+- [ ] Terminal failure-driven HITL sets both `ERROR` and `app.outcome=hitl`; expected business HITL remains non-error.
+- [ ] Error filtering and tail sampling match any `ERROR` span in the trace, not only the root.
+- [ ] Exception detail is logged once through the central renderer: full traceback in local/dev/staging; safe indicators and correlation without raw exception text in production.
 - [ ] Provider-facing GenAI client exception events use `gen_ai.client.operation.exception`; outer application failures use an `app.*` event and are not duplicated.
 - [ ] No exception message appears in a span attribute, span status message, or metric attribute.

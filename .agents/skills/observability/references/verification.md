@@ -93,6 +93,9 @@ Expect zero hits in code this work added or touched.
 - [ ] The exception appears **once** in the logs, with a stack trace, from the boundary that handled it.
 - [ ] That stack trace survives the Collector: with the pipeline deployed, find the canary exception in the log backend and confirm `exception.stacktrace` is still on it. Deleting it on the logs path removes the only copy the error contract leaves.
 - [ ] A handled failure with a successful fallback does **not** mark the span `ERROR`.
+- [ ] Terminal failure-driven HITL marks the owner `ERROR`, keeps `app.outcome=hitl`, and carries the bounded cause.
+- [ ] Expected business HITL remains non-error and is distinguishable by status.
+- [ ] An any-span `ERROR` filter finds the failure even with an unset root; its log carries the owning span's `trace_id`/`span_id`.
 - [ ] Every `error.type` value is a class name, a provider code, or one of `_NONE` / `_OTHER` / `_ABANDONED`.
 
 ## 4. Propagation (multi-service, queue, or durable DB work)
@@ -245,6 +248,8 @@ Query the metrics backend for the canary service's `app.*`, `gen_ai.*`, and
   samples. Example percentages and capacities were not copied as defaults.
 - [ ] Force a service failure and a slow operation; both complete traces reach
   every approved trace backend regardless of the normal-success percentage.
+- [ ] Error retention matches any `ERROR` span and keeps the entire trace; log severity alone does not satisfy this check.
+- [ ] Critical non-errors use a separate bounded-outcome policy instead of false `ERROR` status.
 - [ ] Critical routes/outcomes are matched by bounded, observed attributes. Raw
   user, tenant, request, session, conversation, or workflow-run IDs are not
   general sampling dimensions.

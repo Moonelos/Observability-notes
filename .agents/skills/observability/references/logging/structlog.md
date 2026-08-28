@@ -227,7 +227,7 @@ deprecated and new exception events go to correlated log records
 
 ## Exception logging
 
-Once, at the boundary that handles the exception, with `exc_info=True`. Inner frames add `error.type` to their span and re-raise.
+Log once at the owning boundary and route `exc_info` through the shared renderer: full traceback in local/dev/staging, safe authored message and bounded indicators in production. Redact credentials/tokens everywhere; call sites never branch on environment.
 
 ```python
 try:
@@ -239,7 +239,7 @@ except TimeoutError as exc:
         "model_request_failed",
         # Only needed if named OTel events are enabled; see below.
         otel_event_name="app.model.request.failed",
-        exc_info=True,
+        exc_info=True,  # The central processor applies the safe/full policy.
         **{
             "error.type": type(exc).__name__,
             "gen_ai.request.model": model,
@@ -390,7 +390,7 @@ And a corollary with teeth here specifically: because a tail policy keeps traces
   linked producer trace ID; `workflow_run_id` finds the complete durable run.
 - Event names are stable strings, with variable data in fields.
 - No prompt, completion, token, cookie, or authorization header appears in any log line — grep a captured log sample for a canary secret to prove it.
-- An exception produces exactly one record with a stack trace, not one per frame.
+- An exception produces exactly one record: full traceback in non-production; safe projection and stable indicators without raw exception text in production.
 - If named events are enabled: `event_name` is populated at the top level, and the record appears exactly once.
 
 ## Then

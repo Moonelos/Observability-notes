@@ -98,6 +98,11 @@ def require(condition: bool, message: str) -> None:
         raise ValidationError(message)
 
 
+def require_phrases(text: str, phrases: tuple[str, ...], *, context: str) -> None:
+    for phrase in phrases:
+        require(phrase in text, f"{context} missing {phrase}")
+
+
 def find_quick_validator(explicit: Path | None) -> Path | None:
     """Locate the Codex skill-creator validator, or None if it is not installed.
 
@@ -898,15 +903,18 @@ def validate_compatibility(skill_root: Path) -> list[str]:
 def validate_resource_identity_contract(skill_root: Path) -> None:
     identity_path = skill_root / "references/setup/resource_identity.md"
     identity = identity_path.read_text(encoding="utf-8")
-    for required in (
-        "service.namespace",
-        "service.name",
-        "service.instance.id",
-        "deployment.environment.name",
-        "service.version",
-        "full Git commit SHA",
-    ):
-        require(required in identity, f"resource identity contract missing {required}")
+    require_phrases(
+        identity,
+        (
+            "service.namespace",
+            "service.name",
+            "service.instance.id",
+            "deployment.environment.name",
+            "service.version",
+            "full Git commit SHA",
+        ),
+        context="resource identity contract",
+    )
     # The shape of a repository mapping, not one repository's literal values.
     # Concrete namespaces belong in references/local/, routed on a match: a
     # namespace sitting in an always-loaded file gets adopted by unrelated
@@ -1086,12 +1094,15 @@ def validate_async_work_contract(skill_root: Path) -> None:
     router = " ".join(
         (skill_root / "SKILL.md").read_text(encoding="utf-8").split()
     )
-    for required in (
-        "DB-backed state machines",
-        "Durable handoffs carry context",
-        "stable workflow/run ID",
-    ):
-        require(required in router, f"durable-work router missing {required}")
+    require_phrases(
+        router,
+        (
+            "DB-backed state machines",
+            "Durable handoffs carry context",
+            "stable workflow/run ID",
+        ),
+        context="durable-work router",
+    )
 
     discovery = " ".join(
         (skill_root / "references/discovery.md")

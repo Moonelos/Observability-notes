@@ -67,6 +67,12 @@ work and acceptance criteria; do not disguise example values as defaults.
 Prefer 100% head recording in applications and value-based tail sampling in the
 Collector. Tail sampling can retain errors, final latency, guardrail blocks,
 fallbacks, high usage, and other outcomes learned only after work completes.
+The error policy must retain a complete trace when **any** span has `ERROR`
+status; do not implement it as a root-span-only attribute rule. Logs are sampled
+and retained independently, so error log severity is not an input to this trace
+decision. If a critical non-error outcome such as expected business HITL also
+requires guaranteed retention, add a separate bounded outcome policy rather
+than falsely marking it `ERROR`.
 
 Use a parent-aware head sampler only when recording and transporting all spans
 would itself endanger the service or Collector. State the trade-off explicitly:
