@@ -5,6 +5,23 @@
 Complete **[Kubernetes Installation](03_kubernetes_installation.md)** or the
 equivalent platform deployment first.
 
+The following path connects the stable name to changing ready pods:
+
+```mermaid
+flowchart LR
+    A[checkout-api] -->|HTTP 4318 and /v1/traces| S[otel-gateway DNS]
+    S -->|Ready EndpointSlice address| G[Gateway pod]
+    G -->|Authenticated HTTPS| B[Intended backend]
+    N[App on node without ready agent] --> L[Agent Service with Local policy]
+    L -->|No local endpoint| F[Connection fails]
+```
+
+DNS names the Service, while EndpointSlices identify its ready destinations.
+The ordinary gateway can use remote ready pods. A Local Service intentionally
+removes that fallback, so the app on an empty node fails even when other nodes
+have healthy agents. Accepted spans prove A→G; sent spans and the exact backend
+canary establish G→B. Check the failing boundary before changing selectors.
+
 ---
 
 ## 1. 🧭 Endpoint Follows Topology
@@ -248,6 +265,32 @@ production image.
 | Readiness passes, so delivery is assumed healthy | Backend outages go unnoticed | Monitor receive/export/failure/queue metrics and query a canary. |
 
 ---
+
+## Recap and practice
+
+Choose an address reachable from the client's network namespace, then match
+transport and signal path. Stable DNS and healthy endpoint membership are
+separate conditions.
+
+<details><summary>A generic HTTP base URL becomes a traces-specific URL without adding a path. Why 404?</summary>
+The generic endpoint lets the SDK append /v1/traces. A signal-specific URL is
+used as supplied; add /v1/traces before investigating Service selectors.
+</details>
+
+<details><summary>Would adding a remote ready agent repair Local Service routing?</summary>
+No. Local deliberately restricts selection to the client's node. Restore a
+local endpoint or choose a topology with remote fallback.
+</details>
+
+**Try it:** move checkout-api into another namespace. Choose the gateway's
+namespace-qualified Service DNS name, verify its EndpointSlices, then send a
+unique canary and distinguish accepted input from backend receipt.
+
+<details><summary>Worked solution for try it</summary>
+
+Use otel-gateway.observability.svc.cluster.local from the new namespace. Resolve it, inspect ready EndpointSlices, then require accepted input, acknowledged export and the exact canary at the intended backend. DNS success alone cannot establish a ready pod or exporter delivery.
+
+</details>
 
 ## 🔗 Official References
 

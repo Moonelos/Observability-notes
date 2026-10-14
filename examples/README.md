@@ -63,7 +63,7 @@ Do not substitute custom `ENVIRONMENT` or `RELEASE` metadata keys. `LANGFUSE_TRA
 
 Use this profile for examples 01 and 02. Langfuse owns trace batching and direct export. A separate OpenTelemetry `MeterProvider` sends unsampled operational metrics to a Collector. Do not install a second application `TracerProvider` for the same calls.
 
-> ⚠️ **Watch out:** A second application `TracerProvider` for the same calls creates duplicate generation spans and double-counts usage and cost.
+> ⚠️ **Watch out:** A second bootstrap can lose provider ownership or duplicate export. Two wrappers creating different span IDs for the same model call double-count generations; two exporters copying one existing span are fan-out.
 
 ```python
 # observability.py
@@ -119,7 +119,7 @@ Initialize this module before instrumenting FastAPI or HTTPX. Call `shutdown_obs
 
 Use this profile for example 03. One application-owned OpenTelemetry provider sends traces and metrics to the Collector; the Collector owns Langfuse authentication, redaction, sampling, retry, and fan-out. Do not also initialize a Langfuse direct trace exporter in that process.
 
-> ⚠️ **Watch out:** Do not initialize a Langfuse direct trace exporter alongside Profile B — the Collector owns Langfuse export in this setup, and using both creates duplicate spans.
+> ⚠️ **Watch out:** Adding direct export alongside Collector routing sends the same data twice unless deliberately deduplicated. Choose one export ownership path and one generation creator per physical model call.
 
 ```bash
 export OTEL_SERVICE_NAME="agent-service"
@@ -133,32 +133,33 @@ Configure one `TracerProvider` with an OTLP span exporter and one `MeterProvider
 
 ## 🔒 Safe Capture Default
 
-Mask content before it reaches either an observation or a third-party auto-instrumentation layer. A practical default is an allowlist plus length limits:
+Keep arbitrary question, message, answer and feedback text out of telemetry by default. Regex matching cannot reliably discover every secret in free text. This policy keeps reviewed structured categories and suppresses text entirely:
 
 ```python
-import re
+"""No free-text capture by default. This is a policy boundary, not a secret detector."""
+def safe_text(value: str, *, limit: int = 2000) -> str:
+    # Arbitrary prose has no reliable regex-only secrecy boundary.
+    return '[CONTENT OMITTED]' if value else ''
 
-SECRET = re.compile(r"(?i)(authorization|api[_-]?key|password)\s*[:=]\s*\S+")
-EMAIL = re.compile(r"\b[\w.+-]+@[\w.-]+\.\w+\b")
 
-
-def safe_text(value: str, *, limit: int = 2_000) -> str:
-    value = SECRET.sub(r"\1=[REDACTED]", value)
-    value = EMAIL.sub("[EMAIL]", value)
-    return value[:limit]
+def safe_record(*, status: str, document_ids: list[str]) -> dict:
+    if status not in {'answered', 'no_context', 'failed'}:
+        raise ValueError('unknown status')
+    allowed = {'doc_001', 'doc_002'}
+    return {'status': status, 'document_ids': [x for x in document_ids if x in allowed][:5]}
 ```
 
 The examples intentionally retain only these fields:
 
 | Source | Retain | Drop or mask |
 | --- | --- | --- |
-| Question and answer | Masked, length-bounded text | Secrets, email addresses, excess text |
+| Question and answer | Content omitted by default; explicitly reviewed storage only | Secrets, email addresses, excess text |
 | Retrieved context | Document IDs, ranks, scores, approved short snippets | Full document bodies and ACL metadata |
 | Tool calls | Bounded tool name, outcome, approved IDs | Credentials and raw downstream payloads |
 | Account data | Tier and region from a small allowlist | Names, email, payment data, free-form fields |
-| Feedback | Boolean value and masked comment up to 500 characters | Arbitrary caller metadata |
+| Feedback | Boolean value; free-text comment omitted | Arbitrary caller metadata |
 | Baggage | Opaque user/session IDs and bounded categories | Raw content and authorization decisions |
-| Model messages | Masked copies when capture is allowed | Raw messages by default in restricted workflows |
+| Model messages | Content omitted by default | Raw messages by default in restricted workflows |
 
 Apply an export-stage masker as a second line of defense for spans created by integrations. Test the policy with representative secrets, PII, headers, exceptions, prompts, documents, tool results, and feedback.
 
@@ -177,41 +178,56 @@ Two exporters receiving the same span is intentional fan-out. Two instrumentatio
 
 > 💡 **Key insight:** Two exporters on the same span is intentional fan-out; two instrumentations wrapping the same model call double-counts usage and cost — they look similar but have completely different effects.
 
-## ✅ Run and Verify
+## Run the local baselines
 
-Example 01:
-
-```bash
-export OTEL_SERVICE_NAME=rag-service
-uvicorn rag_app:app --port 8080
-curl -sS http://localhost:8080/answer \
-  -H 'content-type: application/json' \
-  -d '{"question":"How do I reset SSO?"}'
-```
-
-Verify a `rag.answer` trace with retriever, generation, and evaluator children; first-class environment/release filters; model duration and retrieval metrics; and a `citation_present` score.
-
-Example 02:
+Assume basic Python and shell use plus OTel concepts and Python startup/context lessons. From the repository root, install the ranges above into your activated virtual environment, then run:
 
 ```bash
-uvicorn agent_service:app --port 8081
-AGENT_SERVICE_URL=http://localhost:8081 uvicorn gateway_service:app --port 8080
-curl -sS http://localhost:8080/answer \
-  -H 'authorization: Bearer <development-token>' \
-  -H 'content-type: application/json' \
-  -d '{"question":"How do I reset SSO?"}'
+python examples/local/verify_local.py
+LAB_DISABLE_TIER=1 python examples/local/verify_local.py
 ```
 
-Verify one trace ID crosses both services, every tool call appears once with its actual outcome, the agent stops within its limit, and `agent.steps`, tool, and model metrics carry service/environment dimensions.
+These commands launch actual Uvicorn servers on loopback ports 8080–8083, send real HTTP requests, validate denied authentication, RAG output and late-feedback replay/conflict, concurrent in-flight ownership, three-service trace identity and baggage enrichment, then clean up their processes. The changed run proves removing enrichment does not break propagation. Expected lines begin `PASS HTTP auth`, `PASS three-service shared trace_id`, and in the changed run `PASS disabling enrichment`.
 
-Example 03:
+For manual request/response inspection use [RAG](01_rag_with_otel_and_langfuse.md#first-run-the-complete-local-application), [gateway/agent](02_multi_service_agent.md#run-the-complete-local-services), and [Collector policy tests](03_collector_prometheus_langfuse.md). Files under `local/` are supporting executable assets, not another reading path. Keep ports free and stop manually started servers with Ctrl-C before running the harness.
 
-```bash
-otelcol-contrib validate --config collector.yaml
-promtool check rules alerts.yaml
-```
+The local profile uses real Langfuse observation helpers and OTel providers, console spans/metrics, deterministic generation fixtures and local score storage. It verifies payload/parentage/HTTP behavior without proving backend ingestion. To inspect a **live** project, provide real credentials and set `LAB_LANGFUSE_LIVE=1`; the setup then requires all credential fields and applies a suppressive export mask. Live project reads/writes, paid model calls and Kubernetes installation were not run in the local verification. Replace process-local identity/results/feedback with durable, tenant-scoped production adapters before serving real traffic.
 
-Send the policy fixtures from that example. Verify selected complete traces in Langfuse, all operational metrics in the Prometheus-compatible backend, normalized label names, Collector health, and no secret canary values at either destination.
+## Recap
+
+- One component owns provider startup, and one wrapper owns each generation.
+- Console fixtures prove local instrumentation before external service setup.
+- Arbitrary text is omitted by default; structured allowlists carry approved categories.
+- Authentication and answer ownership precede scores and tool work.
+- Separate backend delivery proof from local payload correctness.
+
+## Check yourself
+
+**Two exporters receive one span ID. Are there two generations?**
+
+<details><summary>Answer</summary>
+
+No. That can be intentional fan-out of one completed span. Look for two distinct generation span IDs describing the same physical call before diagnosing duplicate capture.
+
+</details>
+
+**The local runner passes. Does this prove Langfuse Cloud received a score?**
+
+<details><summary>Answer</summary>
+
+No. Local scores use a fixture sink; console output validates spans. Live score ingestion requires a configured backend and verifying the score ID in that project.
+
+</details>
+
+## Try it
+
+Add a new secret canary to feedback in the local runner and leave the export assertion unchanged. Hint: the default policy suppresses the whole comment.
+
+<details><summary>Worked solution</summary>
+
+Submit a comment containing a fake credential. The local request can retain product input for its business role, but the score/export receives `[CONTENT OMITTED]`, so the credential must be absent from all captured telemetry. A regex recognizing only one fake token pattern would not provide this guarantee for arbitrary input.
+
+</details>
 
 ## ✅ Example Review Checklist
 

@@ -1,6 +1,6 @@
 # Deploy The Collector On Kubernetes
 
-> **Who this is for**: Engineers who operate Kubernetes workloads and need a repeatable, production-oriented Collector installation.
+> **Who this is for**: Readers who proved the local pipeline and now need a repeatable Collector installation.
 
 Start with **[Deployment Decisions](01_deployment_decisions.md)** and prove the
 pipeline against its backend with **[Docker Compose](02_docker_compose.md)**.
@@ -11,18 +11,33 @@ pipeline against its backend with **[Docker Compose](02_docker_compose.md)**.
 
 Use one Kubernetes workload for one operational job:
 
-```text
-otel-node-agent DaemonSet
-  -> container logs, host metrics, kubelet metrics
-  -> otel-gateway Service
+A **pod** is the scheduled group containing a process; a **Deployment** replaces
+pods and maintains a replica count. A **Service** gives those changing pod
+addresses one stable name and selects ready endpoints. A **DaemonSet** schedules
+a node agent on each eligible node. A **namespace** groups names and access
+policies; RBAC grants access to the Kubernetes API, not backend credentials.
 
-otel-gateway Deployment
-  -> application OTLP and agent OTLP
-  -> redaction, routing, batching, backend export
+This topology shows which process needs which permission:
 
-otel-cluster Deployment or leader-elected set
-  -> Kubernetes cluster metrics and events
+```mermaid
+flowchart LR
+    A[Application pods] -->|OTLP 4317 or 4318| S[otel-gateway Service]
+    N[Node agent DaemonSet] -->|OTLP| S
+    F[Files on each node] -->|Node mounts| N
+    S --> G1[Gateway 1]
+    S --> G2[Gateway 2]
+    S --> G3[Gateway 3]
+    G1 -->|HTTPS and backend credential| B[Backend]
+    G2 --> B
+    G3 --> B
+    G1 -.->|Metadata watch with RBAC| K[Kubernetes API]
 ```
+
+The Service sends traffic to ready gateway pods; readiness does not establish
+backend receipt. All gateways using Kubernetes attribute enrichment need the
+API permission shown for G1. A pure transport gateway can remove that processor,
+the preset and its API dependency. Node file mounts belong beside agents only.
+
 
 Do not enable node file mounts, cluster-wide API permissions, application OTLP,
 tail sampling, and every backend credential in one Collector merely because the
@@ -33,6 +48,51 @@ The baseline below installs a **stateless gateway Deployment** with the upstream
 Collector Helm chart. It does not collect container logs or cluster metrics.
 
 ---
+
+## First render a pinned baseline locally
+
+Helm is a generator and release manager: values plus a chart produce Kubernetes
+objects. Chart `0.168.0` declares Collector `0.157.0` as its appVersion. This
+historical pair is the teaching baseline; it is not a claim about newest releases.
+[Chart source](https://github.com/open-telemetry/opentelemetry-helm-charts/tree/opentelemetry-collector-0.168.0/charts/opentelemetry-collector).
+
+From the repository root, before accessing any cluster:
+
+```bash
+helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+helm template otel-gateway open-telemetry/opentelemetry-collector \
+  --namespace observability --version 0.168.0 \
+  --values examples/local/deployment_gateway_values.yaml > /tmp/otel-gateway-rendered.yaml
+```
+
+Install PyYAML in a disposable Python environment, then extract the generated
+Collector config (not the input values) from its ConfigMap:
+
+```python
+from pathlib import Path
+import yaml
+objects = list(yaml.safe_load_all(Path('/tmp/otel-gateway-rendered.yaml').read_text()))
+configs = [o for o in objects if o and o['kind'] == 'ConfigMap']
+assert len(configs) == 1
+Path('/tmp/otel-gateway-collector.yaml').write_text(configs[0]['data']['relay'])
+```
+
+Run the exact Kubernetes image against the rendered configuration:
+
+```bash
+docker run --rm --env MY_POD_IP=127.0.0.1 \
+  --env OTLP_BACKEND_ENDPOINT=https://otlp.example.com \
+  --env OTLP_BACKEND_AUTHORIZATION='Bearer validation-placeholder' \
+  --volume /tmp/otel-gateway-collector.yaml:/etc/otelcol/collector.yaml:ro \
+  ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-k8s:0.157.0 \
+  validate --config=/etc/otelcol/collector.yaml
+```
+
+Rendering and validation were executed locally with Helm 3.19.0 and the pinned
+image (checked 2026-10-14). This validates artifact compatibility; it does not
+verify cluster RBAC, CNI, DNS, readiness or backend receipt. Keep install commands
+below behind a disposable-cluster gate. An install succeeds only after the same
+canary proof as chapter 2 reaches the intended backend through the Service.
 
 ## 2. 🔒 Create Namespace And Secret Boundaries
 
@@ -232,6 +292,22 @@ Before using this file:
 - Do not enable `networkPolicy` until required DNS and backend egress have been
   modeled; an empty or incorrect egress policy can silently stop export.
 
+Work the disruption controls with three gateways. `minAvailable: 2` lets a
+cooperative voluntary eviction remove at most one currently healthy pod; an
+attempt to evict a second is blocked until replacement is Ready. A node crash
+can still remove two pods simultaneously because involuntary failure bypasses
+the PDB. A PDB is an eviction budget, not a recovery-capacity guarantee.
+
+The hostname rule is hard: DoNotSchedule leaves a replacement Pending when no
+eligible host can keep the selected replicas within maxSkew=1. With three
+healthy eligible hosts, three replicas can occupy one per host; with only two
+hosts, the 2/1 distribution still meets maxSkew=1, so this rule is not strict
+one-pod-per-host anti-affinity. The zone rule is soft: ScheduleAnyway permits
+a less even zone placement to keep pods schedulable. Inspect actual placement
+and capacity after a failure; these fields do not create missing hosts or zones.
+Run the N-1 throughput calculation in chapter 5 before interpreting three Ready
+pods as high availability.
+
 The Kubernetes attributes preset creates RBAC and adds the processor to enabled
 pipelines. It deliberately does not copy every pod label or annotation because
 that creates cardinality, privacy, and cost risks.
@@ -251,7 +327,7 @@ helm repo update
 
 helm search repo open-telemetry/opentelemetry-collector --versions
 
-export OTEL_CHART_VERSION="<reviewed-chart-version>"
+export OTEL_CHART_VERSION="0.168.0"
 
 helm template otel-gateway open-telemetry/opentelemetry-collector \
   --namespace observability \
@@ -371,7 +447,10 @@ Otherwise, the Helm chart keeps the ownership chain shorter.
 
 ## 6. 📐 DaemonSet And Cluster Collector Differences
 
-For node-local collection, install a second chart release:
+For node-local collection, this is a **preset fragment**, not a complete
+agent-to-gateway deployment. Add an OTLP exporter to the gateway, replace the
+debug exporter in each enabled pipeline and validate the merged configuration
+before installing a second release:
 
 ```yaml
 fullnameOverride: otel-node-agent
@@ -421,6 +500,33 @@ implementation or chart preset uses leader election.
 | Service has no endpoints | Selector mismatch or pods not Ready | Service selector, pod labels, EndpointSlices, and readiness events. |
 
 ---
+
+## Recap and practice
+
+Values generate objects; the rendered ConfigMap configures the exact binary.
+Kubernetes readiness only establishes that the process can serve its probe.
+
+<details><summary>Helm --atomic succeeds but the canary is missing and send failures rise. Accept the release?</summary>
+No. Atomic rollback watches Kubernetes readiness, not logical delivery. Diagnose
+the exact rendered config and export failure, then restore the prior complete
+bundle if the canary gate fails.
+</details>
+
+<details><summary>Why does the node-agent preset fragment not prove forwarding?</summary>
+It names collection presets and a Service, but omits an exporter/pipeline to the
+gateway. Chart defaults can still export only to debug. Inspect merged output.
+</details>
+
+**Try it:** remove the gRPC receiver from the values. Disable its Service port,
+render again and assert both the listener and port are absent. Explain why
+changing only one of them leaves a misleading or unreachable endpoint.
+
+<details><summary>Worked solution for try it</summary>
+
+Set receivers.otlp.protocols.grpc to null and ports.otlp.enabled to false;
+omitting the key would let chart defaults restore the receiver. Render again and inspect both the Collector ConfigMap and Service/container ports. A remaining port advertises a listener that does not exist; a remaining listener creates an unintended access surface.
+
+</details>
 
 ## 🔗 Official References
 

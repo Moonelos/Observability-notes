@@ -1,10 +1,17 @@
 # Langfuse Guide
 
-Last verified against official Langfuse documentation on 2026-07-20.
+Teaching baseline: Python SDK 4.17.0; server-v4 observation-first model. Migration research checked 2026-10-14.
 
 Langfuse is an observability, evaluation, prompt management, and metrics platform for LLM applications. It is built on OpenTelemetry, but it adds LLM-specific concepts that general observability backends do not usually understand well: prompts, generations, model usage, cost, user feedback, scores, datasets, experiments, and review workflows.
 
 This section assumes you already understand the OpenTelemetry basics in [../opentelemetry/README.md](../opentelemetry/README.md). Start here when you want to use Langfuse in production Python applications.
+
+Audience: basic Python programming and ordinary shell use, with the OTel trace/context/export
+foundation taught in this repository. Outcomes: explain an SSO request's evidence, run a local real-SDK
+trace, diagnose a source-selection regression, compare pinned evaluations, and design monitored
+rollout/recovery. Full Langfuse server installation, framework programming, statistically powered
+benchmark design and multimodal application development are outside this path. Hosted ingestion,
+experiments and notifications need project credentials; local success does not verify those gates.
 
 ## 🧭 Mental Model
 
@@ -44,13 +51,13 @@ When something goes wrong, start with metrics or user feedback, open the relevan
 | File | What it covers |
 | --- | --- |
 | [01_overview_data_model.md](01_overview_data_model.md) | Langfuse's trace, observation, generation, score, dataset, prompt, and metric concepts |
-| [02_python_sdk_v4.md](02_python_sdk_v4.md) | Current Python SDK setup and instrumentation patterns |
+| [02_python_sdk_v4.md](02_python_sdk_v4.md) | Pinned SDK v4: complete local smoke, context, export and hardening |
 | [03_otel_ingestion_and_mapping.md](03_otel_ingestion_and_mapping.md) | Sending raw OpenTelemetry spans to Langfuse and mapping attributes correctly |
 | [04_production_observability.md](04_production_observability.md) | Production workflows, privacy, sampling, environments, releases, sessions, and operations |
 | [05_evaluation_metrics_alerting.md](05_evaluation_metrics_alerting.md) | Scores, online/offline evaluation, Langfuse metrics, and alerting patterns |
 | [06_framework_integrations.md](06_framework_integrations.md) | Current integration patterns for LangChain, OpenAI, LiteLLM, and OpenTelemetry-native libraries |
 
-Read the guide in order if you are designing a new rollout. Jump to the integration or production file when you are upgrading an existing service.
+First learn 01 and run 02; you can stop there to inspect and emit a complete local trace. Continue through 04 and 05 to operate releases and evaluation gates. Chapter 03 is conditional for raw OTLP/Collector ownership; 06 is conditional for an existing framework/provider integration. Read the guide in order if you are designing a new rollout. Jump to the integration or production file when you are upgrading an existing service.
 
 ## 📐 Which Integration Should You Use?
 
@@ -171,3 +178,57 @@ The main design goal is not "capture everything." It is "capture enough safe con
 - Attach scores for feedback, evaluators, safety checks, and release gates.
 - Convert important production failures into dataset items.
 - Verify examples against the official docs before copying them into production.
+
+## What's changing
+
+Checked 2026-10-14. SDK major numbers and server major numbers are independent. This course keeps
+its executable **Python SDK 4.17.0** baseline so its examples remain reproducible; new deployments
+should assess the GA upgrade after testing the server/API compatibility boundary.
+
+| Status | Change | Action for this path |
+| --- | --- | --- |
+| GA | Server v4 and Python SDK v5; v5 needs Python ≥3.11 and Cloud or self-hosted server ≥4.59.0 | Retain the v4 pin during reproduction; upgrade the server before moving a self-hosted client to v5. |
+| DEPRECATED | Cloud legacy read APIs/trace ingestion and built-in trace-level evaluators sunset 2026-11-16 | Inventory `api.legacy.*`, old endpoints, rules and exports; migrate reads to observations v2, metrics v2, scores v3 and experiment APIs. SDK-v4 OTLP tracing and score-create writes remain supported. |
+| GA | Stable evaluator/rule APIs with version history | Treat evaluator updates as rollout changes; 05 explains calibration and version evidence. |
+| GA | Historical evaluator backfill | Budget judge cost and distinguish old observation time from new evaluation time; it cannot restore dropped traces. |
+| GA | Dedicated `scores-boolean` view and native boolean-score alerts | Use true-rate aggregation for pass/fail scores; validate server availability and no-data behavior. |
+| GA | Multi-message evaluator prompts and multimodal evaluation | Optional extension: requires compatible judge/provider media support and reviewed delivery/size/privacy policy. |
+
+Sources: [compatibility matrix](https://langfuse.com/docs/compatibility),
+[v4-to-v5 migration](https://langfuse.com/docs/observability/sdk/upgrade-path/python-v4-to-v5),
+[stable evaluator API](https://langfuse.com/changelog/2026-08-27-stable-evaluator-api),
+[backfills](https://langfuse.com/changelog/2026-09-07-evaluator-backfills),
+[metrics views](https://langfuse.com/docs/metrics/features/metrics-api),
+[alerts](https://langfuse.com/docs/observability/features/alerts), and
+[multi-message/media evaluation](https://langfuse.com/changelog/2026-09-01-multi-message-prompts-and-multimodal-inputs).
+Additional migration context: [SDK v5 release](https://langfuse.com/changelog/2026-10-14-python-sdk-v5-js-sdk-v6)
+adds typed/nested metadata filters, gzip span export, experiment URLs and batched direct score writes.
+Use its migration mapping before assuming a one-score `api.scores.create` call has the same shape.
+[API-key expiration](https://langfuse.com/changelog/2026-10-07-api-key-expirations) is GA: rotate the
+replacement into exporters before the old key expires, and prove delivery with a canary. The
+[redesigned session view](https://langfuse.com/changelog/2026-10-13-redesigned-session-view) is GA;
+it improves inspection across turns without changing which trace a late vote targets.
+
+Typed decision-model evaluators are GA integrations for
+[OpenAI decision models](https://langfuse.com/changelog/2026-10-07-openai-decision-model-evaluators)
+and [Jev](https://langfuse.com/changelog/2026-09-22-jev-as-a-judge). Treat them as optional judge
+backends under the same human-calibration/critical-case gate in 05; a specialized score format
+does not establish your rubric's validity. [CLI 1.0](https://langfuse.com/changelog/2026-08-21-langfuse-cli-v1)
+is GA for terminal/automation access, conditional on approved API credentials and access controls.
+
+**PREVIEW / roadmap, not a released guarantee:** the
+[current roadmap](https://langfuse.com/docs/roadmap) lists a Langfuse Gateway, multi-span/session/
+trajectory evaluation, transcript and proactive-issue-detection work, plus finer API-key permissions.
+These directional items do not replace this course's tested ingestion or evaluation path.
+[Organization feature previews](https://langfuse.com/changelog/2026-08-25-organization-feature-previews)
+provide opt-in controls; turning a preview on does not make its API stable. Checked 2026-10-14.
+
+The researched GA changes supersede the old preview framing; experimental integrations still
+require their own locked-version contract. No preview feature is necessary for this path.
+
+For a controlled upgrade, inventory imports and direct API calls, remove deprecated calls using the
+migration mapping, and reproduce the local tree, typed scores, pinned experiment and staging alert
+with an exact new lockfile. Compare parent IDs, usage, score targets and query outputs. Promote
+only after delivery and evaluation gates pass; retain the tested compatible server/config/client
+bundle for rollback. A client downgrade cannot undo a server storage migration, so test the
+server's documented downgrade boundary separately.

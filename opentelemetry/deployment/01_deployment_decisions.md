@@ -2,8 +2,10 @@
 
 > **Who this is for**: Platform and application engineers who understand an OpenTelemetry pipeline but have not yet chosen how to run the Collector.
 
-Before reading this, understand receivers, processors, exporters, and Collector
-topologies in **[Production Architecture](../03_production_architecture.md)**.
+Start with the pipeline in **[OpenTelemetry concepts](../01_concepts.md)**.
+Assumed knowledge is basic Python and shell use. A receiver accepts telemetry,
+a processor changes it, and an exporter sends it onwards. This path teaches
+container and cluster deployment concepts as they become necessary.
 
 ---
 
@@ -27,15 +29,21 @@ A strong default for application traces and application-emitted metrics is a
 gateway Deployment. Use a DaemonSet for work that is genuinely node-local, not
 because "agents are more production-like."
 
-```text
-node-local signals                      shared policy
-┌──────────────────┐                   ┌──────────────────┐
-│ DaemonSet agent  │ -- OTLP --------> │ gateway replicas │ --> backends
-│ logs/host metrics│                   │ redact/route/send│
-└──────────────────┘                   └──────────────────┘
+The diagram separates a machine-local reader from a shared transport service:
 
-application OTLP -----------------------------^
+```mermaid
+flowchart LR
+    A[Application checkout-api] -->|OTLP spans| G[Gateway replicas]
+    N[Node agent] -->|Container log records| G
+    F[Files on this node] -->|Read local paths| N
+    G -->|Central credentials| B[Backend]
 ```
+
+Moving the gateway leaves the files on their original node. Therefore adding
+three gateways cannot replace the node agent: those processes have no access to
+that node's paths. A sidecar instead runs beside one application in its pod;
+it buys pod-level isolation at the cost of one Collector for every pod.
+
 
 > 💡 **Key insight:** Deployment shape follows component ownership: node scrapers belong near nodes, while routing and backend credentials belong in a shared gateway.
 
@@ -193,6 +201,28 @@ Before writing manifests, commit a short answer for every row:
 If any answer is "whatever the default does," resolve it before production.
 
 ---
+
+## Predict the owner
+
+A team needs central backend credentials and log checkpoints that survive gateway
+changes. Put application OTLP and credentials at the gateway; put file readers
+and checkpoints on a node agent. A sidecar is justified when the application
+requires localhost or pod-level isolation, rather than node-wide collection.
+
+## Recap and check yourself
+
+Topology follows state, permissions and failure boundaries. Component inclusion
+comes from the binary; activation comes from configuration.
+
+<details><summary>Can a Helm value add a missing receiver to Core?</summary>
+No. Values configure the installed binary; select or build a distribution that
+contains the receiver and validate the actual configuration with that binary.
+</details>
+
+<details><summary>Why keep a chart version beside the image version?</summary>
+The chart generates ports, probes, RBAC and configuration independently of the
+binary. A change in either artifact can break a previously working route.
+</details>
 
 ## 🔗 Official References
 

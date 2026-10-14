@@ -1,6 +1,107 @@
 # Production Observability Workflows
 
-Last verified against official Langfuse observability documentation on 2026-07-20.
+Pinned baseline retained; incident reasoning and migration research checked 2026-10-14.
+
+## Diagnose and recover one SSO rollout
+
+Role: implementation. Start after [the SDK smoke](02_python_sdk_v4.md); raw-OTLP deployments
+also require [the mapping chapter](03_otel_ingestion_and_mapping.md). These incident values are a
+worked scenario, not a recorded production incident or universal threshold recommendation.
+
+Staging answered the SSO question correctly. Ten minutes after release `sso-a2`, the enterprise
+segment's `answer_correct_v1` mean fell from 0.94 to 0.62 over 200 reviewed answers. HTTP errors
+and p95 model duration stayed steady. “The model is getting worse” is one hypothesis; the evidence
+must distinguish it from the source, prompt and tool hypotheses.
+
+| Evidence | Healthy `sso-a1` | Failing `sso-a2` |
+| --- | --- | --- |
+| Prompt / provider model | v17 / same pinned model | v17 / same pinned model |
+| Retriever index | `support-kb-v2` | `support-kb-v1` |
+| SSO document | `doc_001`, r4 | `doc_001`, r3 |
+| Approved expected action | Account > Identity | Account > Identity |
+| Answer / citation | Account > Identity / doc_001 | Settings > Security / doc_001 |
+| Citation present check | 1 | 1 |
+| Correctness review | 1 | 0 |
+
+Inspect one low-scoring trace, then compare several failed and healthy traces in the same segment.
+The generation accurately repeats the obsolete source. The constant prompt/model and changed
+index support an index-selection regression; they do not prove that every other cause is impossible.
+A presence-only citation evaluator stays green because both revisions share a document ID. That is
+why revision and corpus evidence are necessary, and why correctness requires a separate rubric.
+
+The release changed an enterprise-specific index override to v1. Restore the approved mapping to
+v2 (or roll back the compatible code/config bundle), then repeat the *same* synthetic question.
+The recovery trace must show v2, r4 and Account > Identity, not merely a lower latency. Confirm new
+enterprise observations pass review and the segment metric recovers over the chosen evaluation
+window. Overall recovery while enterprise remains at 0.62 is insufficient: healthy standard traffic
+can hide the unresolved segment. Keep the incident open until the affected segment passes.
+
+Freeze an approved copy of this question, expected action and revision requirements into the
+regression dataset; preserve the source trace link. [Evaluation](05_evaluation_metrics_alerting.md)
+shows how this evidence becomes a same-snapshot baseline/candidate decision. A reviewed expected
+answer is essential: replaying the stale answer as the expectation would preserve the bug.
+
+The signals cross components with different responsibilities:
+
+```mermaid
+flowchart LR
+  U["SSO request"] --> G["Gateway: root + trusted user/session"]
+  G -->|"traceparent + allowed baggage"| R["RAG: index v1, retrieval r3, generation"]
+  G --> C["Collector: redact, batch, route"]
+  R --> C
+  C --> L["Langfuse: correctness 0, source evidence"]
+  C --> M["Metrics: HTTP health, saturation, SLO"]
+  C --> B["Logs: index override/config details"]
+```
+
+Correlation finds the right request across those systems; baggage does not grant authorization.
+Langfuse's evidence selects the source hypothesis, logs identify the config override, and metrics
+show whether the repair introduced a service-health problem. A Collector outage can remove traces
+without reducing request rate, so monitor telemetry delivery alongside product signals.
+
+### Make privacy and cost choices before this evidence leaves the service
+
+The running request is synthetic and approved. For real traffic, choose fields deliberately: document
+ID, revision and rank can explain source selection without retaining full private source text.
+Do not turn a trace into a dataset until the copied fields and longer-lived dataset access/retention
+are approved. A reversible application kill switch stops future capture; it does not delete existing
+traces, exports, dataset copies or backups. Follow the data store's approved deletion process and
+verify all copies within policy scope after a leak.
+
+A plain hash of a guessable email is not anonymization. Use approved keyed pseudonyms or tokens,
+protect the linking secret/table, and treat linkable IDs as personal data. Apply an allowlist before
+instrumentation; a regex that replaces email strings cannot suppress access tokens inside arrays,
+headers, exception messages or third-party payloads. Exercise those carriers in capture tests.
+
+For a cost spike, keep the same boundary discipline. A generation's reported 820 input includes
+600 cache-hit tokens: storing 820 + 600 + 164 counts 1584 instead of 984. Convert to exclusive
+220/600/164 buckets and inspect the matched pricing keys before changing the model. Separately,
+two generation observations for one proxy call double the apparent work even if each usage record
+is correct. Compare actual provider calls, recorded observations and authoritative billing; inferred
+Langfuse cost is engineering evidence, not the provider invoice.
+
+### Retain evidence while an outcome is still observable
+
+The timing of the retention decision limits which diagnosis is possible:
+
+```mermaid
+sequenceDiagram
+  participant A as SSO application
+  participant S as sampling tier
+  participant L as Langfuse
+  participant U as user feedback
+  A->>S: t=0 root starts, head decision
+  A->>S: t=2s final result/error
+  S->>L: t=30s tail decision on buffered candidate
+  U->>L: t=300s correctness feedback for original ID
+```
+
+A head-dropped trace never reaches the tail buffer. A complete candidate retained through 30 seconds
+can be selected by its final error, but feedback at 300 seconds arrives after that decision.
+Only a candidate retained up front can supply the original trace at that time. Raising the head
+rate helps future traffic; it cannot recover previously discarded bytes. Budget buffering from
+arrival rate × decision window × measured payload size, and redact before buffering. If the data
+must never leave the service, sampling does not solve that privacy requirement.
 
 ## 🧭 Mental Model
 
@@ -216,11 +317,22 @@ Privacy review questions:
 
 - Which fields can leave the application boundary?
 - Which fields may be stored in a third-party SaaS or self-hosted Langfuse instance?
-- Which identifiers must be hashed or tokenized?
+- Which identifiers require approved keyed pseudonyms or tokenization?
 - How long should production traces and datasets be retained?
 - Can traces be shared through public links, and who can enable that?
 - Which traces can be promoted into reusable datasets?
 - Are masking tests part of CI or staging validation?
+
+### Rotate keys without losing the delivery proof
+
+Current deployments can assign API-key expiry dates. Suppose the old project key expires Friday:
+create the approved replacement first, update the exporter secret reference, and send a new unique
+synthetic SSO canary. Require backend lookup of its full tree before retiring the old key. If export
+starts returning 401 while accepted counts rise, restore the approved still-valid credential path
+and verify delivery; adding replicas cannot repair authorization. Schedule renewal before expiry,
+track the secret reference/version rather than its value, and test webhook/evaluator credentials
+separately. Existing unexpired keys are not automatically given expiration dates.
+[Key-expiration release](https://langfuse.com/changelog/2026-10-07-api-key-expirations), checked 2026-10-14.
 
 ## 📐 Sampling Strategy
 
@@ -430,3 +542,41 @@ After production rollout:
 - OpenTelemetry ingestion: <https://langfuse.com/integrations/native/opentelemetry>
 - Metrics overview: <https://langfuse.com/docs/metrics/overview>
 - Monitors: <https://langfuse.com/docs/metrics/features/monitors>
+
+## Retain the incident reasoning
+
+- Join alert dimensions to failed and healthy traces before selecting a cause.
+- Constant model/prompt plus changed index/revision points to source selection; a citation can still be stale.
+- Roll back the compatible config/code bundle, verify new trace evidence, and require affected-segment recovery.
+- Sampling timing bounds diagnosis; privacy must be applied before capture or buffering.
+
+**Q: Overall correctness recovers, but enterprise traces still use v1. Can the incident close?**
+
+<details><summary>Answer</summary>
+
+No. Standard traffic can dominate the mean. Verify index v2/r4 and recovered correctness in the
+enterprise segment, with sufficient post-repair coverage over the defined window.
+
+</details>
+
+**Q: A thumbs-down arrives five minutes after a trace was head-dropped. Can a new score rescue it?**
+
+<details><summary>Answer</summary>
+
+No. The original payload was never retained. Raise sampling for future requests or retain the
+bounded feedback-candidate stream up front. Approved application evidence can create a separate
+evaluation record, but cannot recreate missing trace evidence merely from an ID.
+
+</details>
+
+**Try it:** Change the incident so both releases use index v2/r4, but the candidate prompt omits
+the retrieved excerpt. Name the evidence and rollback target before reading the solution.
+
+<details><summary>Worked solution</summary>
+
+Inspect the approved generation request and linked prompt version: correct retrieval does not prove
+that context reached the model. Compare compiled prompt inputs, restore the approved prompt/config,
+and require a new generation containing the expected approved context plus correct output. Re-indexing
+unchanged r4 would not fix the missing prompt context. Keep privacy limits on captured messages.
+
+</details>

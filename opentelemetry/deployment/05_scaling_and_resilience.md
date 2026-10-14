@@ -21,17 +21,18 @@ An in-memory sending queue contains state, but ordinary gateway replicas can
 still scale independently because queued requests do not require coordination.
 That queue's data is lost with the pod unless persistent storage is configured.
 
-```text
-stateless gateway
-  -> ordinary load balancing
-
-scraper
-  -> explicit target or node ownership
-
-tail sampler
-  -> trace-ID-aware router
-  -> one decision replica per trace
+```mermaid
+flowchart LR
+    A[Application spans] --> G[Stateless gateway replicas]
+    G --> B[Backend]
+    F[Node files] --> N[One reader per node]
+    T[Related spans] --> R[Trace ID router]
+    R --> S[One sampler owner per trace]
 ```
+
+Gateway queues are private pending requests, so replicas need no shared trace
+decision. File checkpoints and sampler trace buffers instead identify an owner;
+replicating those owners blindly creates duplicates or splits a decision.
 
 > ⚠️ **Watch out:** Horizontal scaling changes correctness, not just capacity, when a receiver or processor owns state.
 
@@ -108,6 +109,39 @@ and rolling updates. A three-replica deployment that only works while all three
 are healthy is not resilient.
 
 ---
+
+### Work the loss of one replica before choosing HPA limits
+
+Assume a production-shaped load test measured one gateway sustaining 12,000
+spans/s with zero refusals, stable queues and a healthy backend. The normal
+arrival rate is 18,000 spans/s. Three replicas offer 36,000 spans/s, so each
+handles 6,000 at 50% of its measured limit. Losing one replica leaves 24,000:
+each survivor handles 9,000, or 75%. Remaining headroom is 6,000 spans/s across
+the tier, so an increase to 22,000 can fit, while 26,000 cannot. This is an
+illustrative measured input, not a benchmark of every Collector configuration.
+Repeat the test for your signal mix and policy cost.
+
+A three-replica fleet tested only at 30,000 input fails the same outage: two
+survivors offer 24,000, leaving 6,000 spans/s refused or queued. Nominal aggregate
+capacity is insufficient evidence of resilience. Choose requests/limits and
+minimum replicas from the degraded state, then test the actual distribution:
+a sticky gRPC client can overload one survivor even when total capacity fits.
+
+Now hold input at 18,000 while the backend quota falls to 10,000 spans/s. Four
+gateways offer more compute but still send through that shared quota; backlog
+grows by 8,000 spans/s. HPA cannot repair this case. Compare CPU/refusal with
+export latency/throttling and backend quota before selecting an action.
+
+For a planned scale-down, first stop sending **new** requests to the departing
+pod using the owning load-balancer/readiness policy, then allow existing
+connections/work to settle. Observe its queue reaching zero and accepted/sent
+convergence, and only then terminate it within measured grace time. Recheck
+capacity on the two survivors and emit a fresh canary throughout. A PDB limits
+some voluntary disruptions; it neither drains exporter queues nor protects
+against every node failure. Kubernetes readiness withdrawal may not close
+existing gRPC connections, so verify connection draining at your chosen proxy.
+If a backend outage prevents drain, postpone scale-down or retain that replica's
+compatible persistent volume; deleting an in-memory queue abandons its backlog.
 
 ## 4. 🔄 Scale A Stateless Gateway
 
@@ -286,6 +320,38 @@ Important limits:
 - the new component name is `load_balancing`; older releases may expose the
   deprecated alias `loadbalancing`. Validate against the pinned image.
 
+Follow one trace across a membership change:
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant R as Trace router
+    participant S1 as Sampler 1
+    participant S2 as Sampler 2
+    A->>R: t=0, trace abc span root
+    R->>S1: Hash abc under membership version 1
+    Note over R: t=10, DNS adds S2, ring version 2
+    A->>R: t=12, trace abc late ERROR span
+    R->>S2: abc is a moved key under version 2
+    Note over S1: t=30, root alone may be dropped
+    Note over S2: ERROR alone may be retained
+```
+
+This shows one possible moved key, not a guarantee every trace moves. With
+stable membership, root and ERROR would join at S1 before its 30-second
+decision. Now each sampler has partial knowledge; keep-errors cannot recover
+root from S2. Two routers with different DNS snapshots can cause the same split
+without an intentional scale event. Neither a normal ClusterIP nor merely
+longer decision_wait reunites the buffers.
+
+For a planned change, first measure the longest span arrival window, provision
+spare capacity, pause new trace starts in a controlled test, wait for active
+traces plus the decision window to settle, then change membership consistently
+and resume. Test late spans and incomplete traces before relying on that
+procedure. With continuous production traffic, document a bounded transient
+loss objective or engineer stable logical ownership; DNS hashing alone provides
+no zero-loss resharding promise. Sampler restart also loses its in-memory buffer.
+
 Autoscale this tier slowly. Keep router capacity ahead of sampler capacity and
 watch tail-sampling early-drop/late-span metrics during every replica change.
 
@@ -329,6 +395,30 @@ required buffered requests
 Then measure actual bytes per queued request. `queue_size` is commonly requests
 or batches, not spans or bytes, and the exact queue semantics depend on the
 exporter helper version.
+
+Work one outage numerically. Measured traffic is 100 exported requests/s,
+with 200 spans/request and 64 KiB of serialized payload/request. A 60-second
+backend outage needs 100 × 60 = **6,000 requests**. A 25% sizing margin gives
+7,500 request slots; a request-count queue of 2,000 covers only 20 seconds.
+The payload alone occupies 6,000 × 64 KiB = **375 MiB**, or 468.75 MiB at the
+sizing margin. This is a lower bound: object, serialization and storage overhead
+must be measured. A 512 MiB pod cannot safely fit that backlog plus its normal
+working set and limiter headroom.
+
+After recovery, a backend serving 150 requests/s while new input continues at
+100 drains only 50 queued requests/s. Catch-up takes 6,000 / 50 = **120 seconds**.
+At output 100 there is no drain; at output 80 the queue still grows. More gateway
+replicas cannot repair a shared backend quota. Compare this outage plus retry
+schedule to max_elapsed_time; capacity without an adequate retry window is not
+a delivery guarantee.
+
+For disk storage, reserve capacity for serialized backlog plus database/WAL
+overhead, compaction and filesystem headroom. Give each replica one writable
+volume. On restart attach that same volume; on scale-down decide retention
+before deleting its pod/PVC. Never have independent Collectors concurrently
+share one file-storage directory. Test full disk, permission denial and downgrade
+recovery. Chapter 2 shows the lifecycle; its `--persistent` lab verifies process restart with the same directory, while
+volume loss and format downgrade remain external gates.
 
 In-memory queue:
 
@@ -378,6 +468,33 @@ Document acceptable loss. "Telemetry is best effort" is not a measurable
 reliability policy.
 
 ---
+
+## Recap and practice
+
+Scale according to the state owner and bottleneck. Buffer capacity buys finite
+time; recovery needs output capacity above continuing input.
+
+<details><summary>Backend returns 429, CPU is low and the queue grows. Double gateways?</summary>
+A shared quota is the bottleneck. More exporters may increase pressure. Restore
+quota/capacity or reduce admitted traffic, while preserving a measured finite
+buffer. CPU is not evidence that downstream capacity exists.
+</details>
+
+<details><summary>At 100 input requests/s and 120 output, how long to drain 6,000?</summary>
+Net drain is 20 requests/s, so 300 seconds. Using 6,000/120 incorrectly ignores
+5 minutes of continuing incoming work.
+</details>
+
+**Try it:** use 150 input requests/s, 90 seconds outage, 32 KiB/request and
+200 output requests/s after recovery. Compute slots with 25% margin, payload
+bytes, catch-up time, and which extra measurements are required before choosing
+a pod memory limit. Explain what changes if one sampler is added mid-trace.
+
+<details><summary>Worked solution for try it</summary>
+
+Backlog is 150 × 90 = 13,500 requests; 25% margin requires 16,875 slots. Payload is 421.875 MiB, or 527.34375 MiB with margin, before runtime/storage overhead. Net drain is 200 − 150 = 50 requests/s, so catch-up takes 270 seconds. Measure normal working set, object overhead, limiter headroom and retry lifetime. Adding a sampler can move active trace ownership and split root/late spans even when compute headroom increases.
+
+</details>
 
 ## 🔗 Official References
 

@@ -12,6 +12,52 @@ This example shows a single Python service that:
 
 Use the direct SDK bootstrap from [README.md](README.md). Set `LANGFUSE_RELEASE` and `LANGFUSE_TRACING_ENVIRONMENT` before constructing the client.
 
+## First run the complete local application
+
+From the repository root, use [the local lab setup](README.md#run-the-local-baselines). The canonical [rag_app.py](local/rag_app.py) implements `/answer`, authenticated server-derived identity, answer ownership, late feedback, metric recording and shutdown. Its model is deterministic; real Langfuse helpers export spans to the console and scores go to a local fixture. No provider or Langfuse backend receipt is claimed in this mode.
+
+```bash
+cd examples/local
+LAB_PUBLIC_TOKEN=local-user-token uvicorn rag_app:app --host 127.0.0.1 --port 8083
+```
+
+In a second terminal:
+
+```bash
+curl --fail-with-body -sS http://127.0.0.1:8083/answer -H 'authorization: Bearer local-user-token' -H 'content-type: application/json' -d '{"question":"How do I reset SSO?"}'
+```
+
+Use the returned `langfuse_trace_id` in the feedback path below; the token identifies the same owner. Replace `RETURNED_TRACE_ID` with that exact value.
+
+```bash
+curl --fail-with-body -i http://127.0.0.1:8083/answers/RETURNED_TRACE_ID/feedback -H 'authorization: Bearer local-user-token' -H 'content-type: application/json' -H 'idempotency-key: feedback-0001' -d '{"accepted":false,"comment":"Stale citation"}'
+```
+
+The first request returns an answer and trace ID; feedback returns 204. Repeating the same key and payload returns 204, while changing its payload returns 409. An unknown or another owner's answer returns 404 without revealing existence. The fixture binds each score ID to the answer and retry key. Its dictionary state is process-local and lost on restart; production replaces it with a tenant-scoped durable repository plus an outbox for uncertain score writes. Do not hold a database lock across an external backend call: commit the outbox intent then deliver and reconcile separately.
+
+The diagram follows one SSO request through completion and a later judgment:
+
+```mermaid
+sequenceDiagram
+    participant U as Authenticated user-a
+    participant R as rag.answer
+    participant D as rag.retrieve
+    participant M as llm.generate_answer stub
+    participant E as citation evaluator
+    U->>R: POST /answer SSO question
+    R->>D: approved retrieval
+    D-->>R: doc_001
+    R->>M: approved source context
+    M-->>R: answer with doc_001
+    R->>E: citation formatting check
+    E-->>R: citation_present=1
+    R-->>U: answer plus trace_id
+    U->>R: feedback accepted=false + retry key
+    R->>R: verify stored owner, write score for original trace
+```
+
+The feedback arrives after the generation ended, so it is a judgment attached to an existing trace rather than a nested timed model call. Change the input to `EMPTY`: retrieval returns no documents, the service returns `no_context`, and generation/duration/token measurements are absent because no model call was attempted. The citation check only checks formatting; it cannot prove the model's claim is entailed by the source.
+
 ## 🔄 Shape of the Trace
 
 ```text
@@ -21,11 +67,14 @@ rag.answer
   evaluator.citation_check
 ```
 
+## Provider-backed RAG continuation
+
+The next block is an implementation excerpt for replacing the local generation stub. It requires Profile A, a configured OpenAI account, and an authorized retrieval implementation. The local fixture owns the complete route, persistence and lifecycle; this function alone is not a web service.
+
 ## 🛠️ RAG Code
 
 ```python
 import os
-import re
 import time
 from dataclasses import dataclass
 
@@ -64,14 +113,7 @@ operation_failures = meter.create_counter(
     description="Failed GenAI client operations",
 )
 
-SECRET = re.compile(r"(?i)(authorization|api[_-]?key|password)\s*[:=]\s*\S+")
-EMAIL = re.compile(r"\b[\w.+-]+@[\w.-]+\.\w+\b")
-
-
-def safe_text(value: str, *, limit: int = 2_000) -> str:
-    value = SECRET.sub(r"\1=[REDACTED]", value)
-    value = EMAIL.sub("[EMAIL]", value)
-    return value[:limit]
+from privacy import safe_text
 
 
 @dataclass(frozen=True)
@@ -170,6 +212,7 @@ def answer_question(question: str, *, user_id: str, session_id: str) -> dict:
             ]
 
             metric_attrs = {
+                "http.route": "/answer",
                 "gen_ai.operation.name": "chat",
                 "gen_ai.provider.name": "openai",
                 "gen_ai.request.model": model,
@@ -206,9 +249,9 @@ def answer_question(question: str, *, user_id: str, session_id: str) -> dict:
                     generation.update(
                         output=safe_text(answer),
                         usage_details={
-                            "input_tokens": usage.prompt_tokens if usage else 0,
-                            "output_tokens": usage.completion_tokens if usage else 0,
-                        },
+                            "input_tokens": usage.prompt_tokens,
+                            "output_tokens": usage.completion_tokens,
+                        } if usage is not None else None,
                     )
                 except Exception as exc:
                     outcome = "error"
@@ -268,6 +311,8 @@ The model-call duration is recorded in `finally`, so timeouts and provider error
 
 Do not expose a helper that writes a score for any caller-supplied trace ID. Authorize against the application record that stored the answer, not against baggage or a value echoed by the browser.
 
+The following is a production adapter excerpt: connect the fail-closed repository function to your application storage before exposing it. The executable local endpoint is in `local/rag_app.py`.
+
 ```python
 from typing import Annotated
 from uuid import NAMESPACE_URL, uuid5
@@ -290,14 +335,13 @@ class Identity(BaseModel):
     tenant_id: str
 
 
-def require_identity() -> Identity:
-    # Validate the session/JWT and return server-derived identity.
-    ...
+from identity import require_identity
 
 
 def load_stored_answer(trace_id: str):
-    # Return the application's answer record, including owner and tenant IDs.
-    ...
+    raise NotImplementedError("Supply a tenant-scoped application answer repository")
+
+
 
 
 @app.post("/answers/{trace_id}/feedback", status_code=204)
@@ -352,3 +396,39 @@ Export OpenTelemetry metrics and alert on:
 - HTTP request error rate from FastAPI instrumentation.
 
 Use Langfuse for trace inspection, prompt-version comparison, cost/latency analysis, and examples behind low evaluator or user-feedback scores.
+
+## Recap
+
+- Authorized retrieval supplies approved context before a model call.
+- Empty retrieval returns no_context without manufacturing a generation.
+- Generation duration and tokens measure attempted calls, independently of trace retention.
+- Store the trace with the answer so late feedback can verify ownership.
+- Citation presence is formatting evidence; groundedness requires claim/source evaluation.
+
+## Check yourself
+
+**EMPTY returns HTTP 200. Should model duration receive a zero?**
+
+<details><summary>Answer</summary>
+
+No call occurred. A zero measurement would incorrectly imply a very fast model request. Record retrieval/HTTP outcomes; omit model duration and usage for that request.
+
+</details>
+
+**A retry reuses a feedback key but changes accepted=false to true. What should happen?**
+
+<details><summary>Answer</summary>
+
+409 rejects a payload conflict. A retry must repeat the original operation, otherwise one key would ambiguously name two judgments.
+
+</details>
+
+## Try it
+
+Using the existing `/answer` scaffold, add a second empty-retrieval trigger without adding a model call. Hint: change the retrieval condition and keep the early-return path.
+
+<details><summary>Worked solution</summary>
+
+Extend the local document selection to return [] for both `EMPTY` and `NO_PERMISSION`, then invoke each. Both increment empty-retrieval and record document count zero, while neither creates llm.generate_answer. In production, authorization belongs in the retriever and the public result must avoid disclosing forbidden document existence.
+
+</details>

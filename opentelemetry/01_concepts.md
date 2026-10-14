@@ -25,6 +25,21 @@ OpenTelemetry does not replace your backend. It standardizes what your code
 emits and how telemetry moves to tools such as Jaeger, Prometheus, Grafana,
 Datadog, Honeycomb, Elastic, or Langfuse.
 
+The pipeline diagram separates the request's recording state from the destination's storage. Follow the export arrows, which carry completed telemetry rather than application requests:
+
+```mermaid
+flowchart LR
+    A["chat-api POST /chat instrumentation"] --> B["API calls: spans and measurements"]
+    B --> S["SDK: resource, context, aggregation"]
+    S --> O["OTLP export batches"]
+    O --> C["Collector receiver then processors"]
+    C --> T["trace backend"]
+    C --> M["metrics backend"]
+    C --> L["log backend"]
+```
+
+The application first describes work, the SDK records/aggregates it, and the Collector routes exported batches. Backend storage is the final boundary. A request succeeding does not prove every arrow succeeded; this distinction makes the later accepted/sent/canary checks necessary.
+
 ## 📌 What OpenTelemetry Is Not
 
 It is important to be precise:
@@ -208,7 +223,7 @@ A span represents one operation or unit of work. Important span fields are:
 | `kind` | Role of the span: `SERVER`, `CLIENT`, `INTERNAL`, `PRODUCER`, or `CONSUMER`. |
 | timestamps | Start time, end time, and duration. |
 | attributes | Key-value metadata such as route, model, DB system, outcome. |
-| events (legacy) | Timestamped records embedded in the span. The recording API is being deprecated; new instrumentation should emit named log records correlated with the span instead. |
+| span events | Timestamped records embedded in the span. OTel has announced gradual recording-API deprecation; existing data and APIs remain supported during the transition. Prefer correlated log-based events in new instrumentation. |
 | links | References to related spans that are not parent-child. Useful for queues and batch work. |
 | status | Whether the operation ended in error. |
 
@@ -274,6 +289,71 @@ LogRecord event_name: app.provider.request.exception
 
 Use an ordinary log record when the message is diagnostic but does not define a stable event schema. Use a span attribute when the value describes the operation as a whole and does not need its own timestamp.
 
+#### Why new events belong in the logs pipeline
+
+Checked 2026-10-14. OpenTelemetry's [March 2026 announcement](https://opentelemetry.io/blog/2026/deprecating-span-events/)
+recommends the Logs API for new events and exceptions, with a gradual deprecation
+plan for `Span.AddEvent` and `Span.RecordException`. This is a transition, not removal
+of existing span-event data. The [current tracing specification](https://opentelemetry.io/docs/specs/otel/trace/api/#add-events)
+still defines `AddEvent`; inspect your language SDK's actual release behavior.
+Separately, [exception-on-span conventions](https://opentelemetry.io/docs/specs/semconv/exceptions/exceptions-spans/)
+are explicitly deprecated in favor of [exceptions on logs](https://opentelemetry.io/docs/specs/semconv/exceptions/exceptions-logs/).
+
+Choose a representation from what happened during the same `/chat` request:
+
+| Fact | Representation | Reason |
+| --- | --- | --- |
+| A model call took 700 ms | Span | An operation with a duration and boundary. |
+| The requested model was `demo-model` | Span attribute | A property of the whole call. |
+| Retry attempt 2 was scheduled at a particular instant | Named log-based event | A timestamped occurrence that may repeat. |
+| A diagnostic message needs no stable event schema | Ordinary log | Human-readable local detail. |
+
+A named OTel event is a `LogRecord` with a non-empty top-level `event_name`;
+the [general event conventions](https://opentelemetry.io/docs/specs/semconv/general/events/)
+are still Development. A JSON key named `event_name` needs a bridge or ingest mapping
+to become that OTel field. Keep the active trace and span context on the record.
+
+Follow a retry event's route separately from its model span:
+
+```mermaid
+flowchart LR
+    M["active chat demo-model span"] --> E["named retry log: same trace_id and span_id"]
+    M --> T["traces exporter → APM and GenAI destination"]
+    E --> L["logs exporter or mapped log agent → log backend"]
+    L --> C["correlate to model span using IDs"]
+    T --> C
+```
+
+Correlation connects these records but does not transport them together. A traces-only
+Langfuse exporter does not deliver a new log event; configure a logs destination and
+verify its trace links. Moving an exception to logs also does not set the span's error
+status: keep status and bounded `error.type` on the failing operation.
+
+Embedded span events disappear when their span is dropped. Logs use an independent
+pipeline, so a log can survive trace sampling and point to a trace that was never
+stored. That is expected; it does not prove broken context. Apply log retention,
+redaction, and volume policy separately. A named exception can carry sensitive details
+just as an ordinary exception log can.
+
+For migration, first establish working log export/correlation, then enable log-only
+exceptions where the installed instrumentation supports
+`OTEL_SEMCONV_EXCEPTION_SIGNAL_OPT_IN=logs`. `logs/dup` is a temporary comparison mode,
+not a permanent default. Confirm exported signals and backend views; do not assume
+every instrumentation honors the variable or implements a log-to-span-event compatibility
+layer. [Python log setup](02_python_instrumentation.md#-optional-otel-log-export)
+contains the named-event bridge. The [local destination canary](../examples/local/genai_destination_filter.py)
+also verifies a named retry log correlated with a model span, without creating a span event.
+
+<details>
+<summary>Check yourself: a retry event reaches the log backend but the trace is absent. Should you create another span for the event?</summary>
+
+No. First check whether trace sampling or destination filtering discarded the span.
+Logs and traces export independently. The retry remains a point-in-time event, and
+creating another span would not repair the original retention decision. Verify the
+log's IDs and both pipelines' delivery policies before diagnosing context loss.
+
+</details>
+
 Use links when there is a relationship but not a direct parent-child hierarchy.
 For example, a batch job that processes 100 messages may link to the producing
 spans rather than pretending one message is the parent of the whole batch.
@@ -322,6 +402,25 @@ single-message flows. A new trace plus a link is useful when the queue boundary
 is also a lifecycle boundary, or when one consumer operation represents a
 batch with several producing contexts. Choose one policy deliberately and
 apply it consistently.
+
+This timeline follows the producer carrier into a later worker. Look at the new root and link rather than assuming delayed work is synchronous child work:
+
+```mermaid
+sequenceDiagram
+    participant H as chat-api POST /chat in Trace A
+    participant P as send exception-analysis-results
+    participant Q as fake queue carrier
+    participant W as process exception-analysis-results in Trace B
+    participant D as INSERT analysis_result
+    H->>P: publish provider_failed result
+    P->>Q: inject Trace A and producer span ID
+    H-->>H: HTTP 202, root UNSET
+    Q->>W: dequeue message-987 later
+    W->>W: new root Trace B, link to producer Trace A
+    W->>D: persist result as child in Trace B
+```
+
+The queue retains a serialized carrier after the producer ends. The worker extracts it for the link, then explicitly uses an empty parent context to start a different trace. Its database child inherits Trace B from the worker; the producer reference remains a link. If the worker instead uses the extracted context as parent, it continues Trace A—the policy choice changes tree membership, not the fact that work was caused by the message.
 
 ##### One Span With Every Major Field
 
@@ -1589,8 +1688,7 @@ exporters:
   otlphttp/traces:
     endpoint: https://apm.example.com/otlp
   prometheus_remote_write:
-    http:
-      endpoint: https://prometheus.example.com/api/v1/write
+    endpoint: https://prometheus.example.com/api/v1/write
 
 service:
   pipelines:
@@ -1919,3 +2017,37 @@ specific parts of the map:
   metric design, Prometheus-style alerts, and runbooks.
 - [06_genai_and_llm_observability.md](06_genai_and_llm_observability.md) covers
   GenAI semantic conventions and how they apply to LLM and agent systems.
+
+## Recap
+
+- A trace follows one execution through span IDs, shared trace identity and parent context.
+- A parent reports its own outcome; a handled child failure need not fail it.
+- Metrics aggregate measurements by attributes and remain independent of trace sampling.
+- Baggage transports context; copying it into attributes is a separate deliberate action.
+- SDK recording, Collector acceptance and backend storage are distinct delivery boundaries.
+
+## Check yourself
+
+**The worker starts a new trace linked to the producer. Does its database child use the producer trace ID?**
+
+<details><summary>Answer</summary>
+
+No. A child inherits the worker's current context. The link references the producer but does not replace parentage, so the database span remains in the worker trace.
+
+</details>
+
+**An error child is handled and the root returns HTTP 202. Must the root be ERROR?**
+
+<details><summary>Answer</summary>
+
+No. The root successfully accepted asynchronous work. Its status describes that operation, while the child retains the provider failure evidence.
+
+</details>
+
+**A trace is dropped by tail sampling. Must its metric and correlated log disappear?**
+
+<details><summary>Answer</summary>
+
+No. Independent signal pipelines export measurements and logs without inheriting that tail decision. A log's trace ID can point to a trace that is no longer retained.
+
+</details>

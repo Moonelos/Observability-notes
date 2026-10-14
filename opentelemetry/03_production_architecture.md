@@ -334,10 +334,9 @@ exporters:
       api-key: "${env:APM_API_KEY}"
 
   prometheus_remote_write:
-    http:
-      endpoint: https://prometheus.example.com/api/v1/write
-      headers:
-        authorization: "Bearer ${env:PROMETHEUS_TOKEN}"
+    endpoint: https://prometheus.example.com/api/v1/write
+    headers:
+      authorization: "Bearer ${env:PROMETHEUS_TOKEN}"
 
   otlphttp/logs:
     endpoint: https://logs.example.com/otlp
@@ -368,7 +367,26 @@ service:
       exporters: [otlphttp/logs]
 ```
 
-This is the advertised destination-specific split in executable form. The same receiver feeds two trace pipelines. Langfuse receives approved, application-masked LLM input/output after universal secret fields are removed. The general APM backend receives the same trace shape, timing, status, model, and usage attributes after payload fields are removed. Named events now travel through the logs pipeline, where the same sensitive payload attributes are removed and every body is suppressed by default. Replace that conservative body rule only after defining and testing a log-body masker.
+This is a deployment template with placeholder endpoints and credentials. For pinned Contrib 0.158.0, remote-write `endpoint` and `headers` belong directly under the exporter, as shown in the [release schema](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.158.0/exporter/prometheusremotewriteexporter/README.md) (checked 2026-10-14); there is no nested `http` object. Validate using that exact distribution before supplying real destinations. This is the destination-specific split in configuration form. The same receiver feeds two trace pipelines. Langfuse receives approved, application-masked LLM input/output after universal secret fields are removed. The general APM backend receives the same trace shape, timing, status, model, and usage attributes after payload fields are removed. Named events now travel through the logs pipeline, where the same sensitive payload attributes are removed and every body is suppressed by default. Replace that conservative body rule only after defining and testing a log-body masker.
+
+Watch where the same approved input diverges. The destination-specific transform sits only on the APM trace branch, and the log branch has its own body policy.
+
+```mermaid
+flowchart LR
+  R[OTLP receiver: one SSO workflow] --> L[Langfuse branch: memory limit and resource enrichment]
+  R --> A[APM branch: memory limit and resource enrichment]
+  R --> G[Logs branch: memory limit and resource enrichment]
+  L --> LS[drop_secrets: credentials and exception fields]
+  A --> AS[drop_secrets: credentials and exception fields]
+  G --> GS[drop_secrets: credentials and exception fields]
+  LS --> LB[batch then otlphttp/langfuse]
+  AS --> AR[redact_apm: remove input and output content]
+  AR --> AB[batch then otlphttp/traces]
+  GS --> GR[redact_apm: content keys plus body suppression]
+  GR --> GB[batch then otlphttp/logs]
+```
+
+Langfuse retains application-masked model input because its branch removes universal secrets without the APM content transform. APM keeps the same span IDs, duration, status and usage, but loses the content fields before export. Logs remain a separate signal: their bodies are suppressed even if a trace's masked input is approved elsewhere. Moving the content transform before the fork would remove the approved rich payload from Langfuse too; moving it after either destination would be too late to enforce that destination's permission boundary. Processor instances belong to their pipeline, so this fork must be tested at both outputs.
 
 "Rich" never means raw. Mask or allowlist question, prompt, document, tool, account, and output content in the application before it enters a span or log event. Collector deletion by key cannot find a secret embedded inside an otherwise allowed JSON string. Test both destinations with canary API keys, emails, authorization headers, exception messages, log-event attributes and bodies, legacy LLM keys, and Langfuse root/observation payloads.
 
@@ -379,6 +397,8 @@ Validate config before deploying:
 ```bash
 otelcol validate --config=collector.yaml
 ```
+
+A matching extracted template is [otel_collector_production.yaml](../examples/local/otel_collector_production.yaml). Validation against Contrib 0.158.0 with synthetic environment values succeeded on 2026-10-14; this checks the component schema, not remote credentials or destination permissions. [The local signal test](../examples/local/otel_collector_signal_test.py) executes the richer/redacted split with file destinations, a real SDK named log, and canary bodies/attributes. Its terminal PASS verifies local privacy and metric label behavior. It does not establish safe handling of arbitrary nested application JSON or remote backend storage.
 
 In CI, validate every Collector config change. In production, deploy config
 changes gradually because a bad telemetry config can create blind spots during
@@ -656,6 +676,21 @@ must be measured before it can be called production-ready.
 
 At scale, use trace-ID-aware load balancing before the tail-sampling tier so all
 spans for the same trace land on the same Collector instance.
+
+Watch where spans for trace `abc123` meet. The router must choose the same sampler for both services, even if the spans arrive in different OTLP batches.
+
+```mermaid
+flowchart LR
+  A[chat-api trace abc123] -->|root and client spans| R[trace-ID-aware routing tier]
+  B[retrieval trace abc123] -->|server span| R
+  R -->|hash abc123| T1[tail sampler 1]
+  R -->|other trace IDs| T2[tail sampler 2]
+  T1 -->|retained complete trace| O[trace backend]
+  T2 -->|retained traces| O
+```
+
+Sampler 1 can now see that retrieval failed and retain the containing chat request. A round-robin router could send the successful root to sampler 1 and the failing child to sampler 2; each makes a decision from incomplete evidence. Hash the trace ID, not the OTLP request, client IP, or persistent connection. Changing sampler membership can change the hash mapping while traces are still arriving. Drain and canary topology changes, measure complete-trace arrival time, and follow the deployment guide's rollout continuation rather than assuming consistent hashing prevents every in-flight split.
+
 
 > ⚠️ **Watch out:** Tail sampling silently produces incomplete traces if spans for the same trace arrive at different Collector replicas — you must route by trace ID before the tail-sampling tier, not by standard round-robin.
 
@@ -1114,6 +1149,34 @@ Sensitive data appears in a backend:
 - Collector redaction ran after fan-out;
 - a backend received the raw pipeline instead of the redacted one;
 - prompts and outputs were enabled without a masking policy.
+
+## Recap and decisions
+
+Application code creates meaning and correlation. The Collector applies signal-specific transport and retention policy. Affinity makes a tail decision coherent; it does not align log retention or recover spans that the SDK already discarded. Redaction must precede the destination that cannot receive content, while queues buy a finite outage interval.
+
+### Check yourself
+
+1. A failed retrieval and its successful root reach different samplers. Why is “retain errors” insufficient?
+2. An ERROR log reached CloudWatch before its trace was rejected. What remains?
+3. At 2,000 spans/s, a queue holds 120,000 spans and the backend stops. How long is the nominal buffer?
+
+<details><summary>Reasoned answers</summary>
+
+1. Each sampler sees only its own fragment. One can retain the failure without the root; the other can drop the successful root. Routing must assemble the trace before deciding.
+2. The log remains with valid correlation IDs. Standard tail sampling has no authority to recall it; cross-signal retention needs an explicit stateful buffer.
+3. `120,000 / 2,000 = 60s` before burst, memory, retry, batch-size, or queue-unit effects. This is a planning bound, not an availability guarantee; test the actual exporter units and outage recovery throughput.
+
+</details>
+
+### Try it: change the trust boundary
+
+A new APM contract prohibits prompt content, while Langfuse may receive masked content. Choose between one shared pipeline with two exporters and separate destination pipelines. Sketch the redaction position and describe a canary test without real secrets.
+
+<details><summary>Worked decision</summary>
+
+A shared pipeline sends identical processed records to both exporters, so it either leaks content to APM or removes the approved Langfuse payload too. Split the traces pipeline; remove universal secrets on both, then remove content on the APM branch. Inject synthetic canary markers into attributes, named log-event bodies, exception strings and nested JSON. Inspect every destination and confirm the forbidden markers are absent. A key-only deletion test cannot establish nested-value privacy.
+
+</details>
 
 **Next**: Apply this architecture with the
 [Collector Deployment Guide](deployment/README.md), then continue to

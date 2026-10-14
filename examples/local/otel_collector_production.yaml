@@ -1,0 +1,137 @@
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 1024
+    spike_limit_mib: 256
+  resource/add_environment:
+    attributes:
+    - key: deployment.environment.name
+      value: production
+      action: upsert
+  attributes/drop_secrets:
+    actions:
+    - key: http.request.header.authorization
+      action: delete
+    - key: http.request.header.cookie
+      action: delete
+    - key: http.response.header.set_cookie
+      action: delete
+    - key: db.query.text
+      action: delete
+    - key: db.statement
+      action: delete
+    - key: user.email
+      action: delete
+    - key: exception.message
+      action: delete
+    - key: exception.stacktrace
+      action: delete
+  transform/redact_apm:
+    error_mode: propagate
+    trace_statements:
+    - context: span
+      statements:
+      - delete_key(attributes, "gen_ai.system_instructions")
+      - delete_key(attributes, "gen_ai.input.messages")
+      - delete_key(attributes, "gen_ai.output.messages")
+      - delete_key(attributes, "gen_ai.tool.definitions")
+      - delete_key(attributes, "gen_ai.tool.call.arguments")
+      - delete_key(attributes, "gen_ai.tool.call.result")
+      - delete_key(attributes, "langfuse.observation.input")
+      - delete_key(attributes, "langfuse.observation.output")
+      - delete_key(attributes, "langfuse.trace.input")
+      - delete_key(attributes, "langfuse.trace.output")
+      - delete_key(attributes, "llm.prompts")
+      - delete_key(attributes, "llm.completions")
+    log_statements:
+    - context: log
+      statements:
+      - delete_key(attributes, "gen_ai.system_instructions")
+      - delete_key(attributes, "gen_ai.input.messages")
+      - delete_key(attributes, "gen_ai.output.messages")
+      - delete_key(attributes, "gen_ai.tool.definitions")
+      - delete_key(attributes, "gen_ai.tool.call.arguments")
+      - delete_key(attributes, "gen_ai.tool.call.result")
+      - delete_key(attributes, "langfuse.observation.input")
+      - delete_key(attributes, "langfuse.observation.output")
+      - delete_key(attributes, "langfuse.trace.input")
+      - delete_key(attributes, "langfuse.trace.output")
+      - delete_key(attributes, "llm.prompts")
+      - delete_key(attributes, "llm.completions")
+      - set(body, "[REDACTED_BY_COLLECTOR]") where body != nil
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+exporters:
+  otlphttp/langfuse:
+    endpoint: https://cloud.langfuse.com/api/public/otel
+    headers:
+      Authorization: Basic ${env:LANGFUSE_AUTH_STRING}
+      x-langfuse-ingestion-version: '4'
+  otlphttp/traces:
+    endpoint: https://apm.example.com/otlp
+    headers:
+      api-key: ${env:APM_API_KEY}
+  prometheus_remote_write:
+    endpoint: https://prometheus.example.com/api/v1/write
+    headers:
+      authorization: Bearer ${env:PROMETHEUS_TOKEN}
+  otlphttp/logs:
+    endpoint: https://logs.example.com/otlp
+    headers:
+      api-key: ${env:LOGS_API_KEY}
+service:
+  extensions:
+  - health_check
+  pipelines:
+    traces/langfuse:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - resource/add_environment
+      - attributes/drop_secrets
+      - batch
+      exporters:
+      - otlphttp/langfuse
+    traces/apm:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - resource/add_environment
+      - attributes/drop_secrets
+      - transform/redact_apm
+      - batch
+      exporters:
+      - otlphttp/traces
+    metrics:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - resource/add_environment
+      - batch
+      exporters:
+      - prometheus_remote_write
+    logs:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - resource/add_environment
+      - attributes/drop_secrets
+      - transform/redact_apm
+      - batch
+      exporters:
+      - otlphttp/logs

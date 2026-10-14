@@ -1,10 +1,10 @@
 # Python SDK v4
 
-Last verified against official Langfuse Python SDK documentation on 2026-07-20.
+Pinned SDK 4.17.0; local execution and migration research checked 2026-10-14.
 
 ## 🧭 Mental Model
 
-The current Langfuse Python SDK is v4. Import from `langfuse`, not from the legacy `langfuse.decorators` module.
+This lesson deliberately pins Langfuse Python SDK 4.17.0. Python SDK v5 is now GA; see [migration context](README.md#whats-changing). Import from `langfuse`, not from the legacy `langfuse.decorators` module.
 
 Use the SDK when you are writing Python LLM application code and want Langfuse-specific features such as observations, generations, scores, prompt management, datasets, and experiments.
 
@@ -22,10 +22,74 @@ It solves application-level trace shape: what the workflow did, which model call
 
 Use the SDK when you can edit the Python code. Use [03_otel_ingestion_and_mapping.md](03_otel_ingestion_and_mapping.md) when the service is not Python/JS, when a platform team requires raw OTLP, or when a Collector owns routing.
 
+## Run one complete SSO workflow
+
+Role: implementation. Read [the request-to-score model](01_overview_data_model.md) first.
+This first run uses the real SDK and a deterministic model stub, so it requires no provider key,
+Langfuse account, or external ingest. The in-memory exporter replaces network export and lets
+us check that the final batch contains the expected observations.
+
+From the repository root:
+
+```bash
+python3 -m venv /tmp/langfuse-notes-venv
+/tmp/langfuse-notes-venv/bin/pip install "langfuse==4.17.0"
+/tmp/langfuse-notes-venv/bin/python examples/local/langfuse_sdk_smoke.py
+```
+
+The complete canonical script is [langfuse_sdk_smoke.py](../examples/local/langfuse_sdk_smoke.py).
+It invokes `main()` explicitly, opens `rag.answer`, retrieves approved synthetic `doc_001`, then
+opens `llm.generate_answer` under the still-active root. It updates generation output/usage and
+root output, prints the trace and generation IDs, and calls `flush()` in `finally` before shutdown.
+Its keys are dummy local identifiers; `span_exporter=memory` prevents trace network export.
+There is no API write or auth check in local mode.
+
+Expected output contains an answer and two generated hexadecimal IDs, followed by:
+
+```text
+PASS: 3 observations; one trace; both children parented to rag.answer; final batch flushed
+```
+
+IDs vary each run; the provider output and tree are deterministic. The assertions inspect *exported*
+spans, rather than trusting names or return values. All three share a trace ID; both children have
+the root's observation ID as parent. That is the first usable result. It verifies context and
+batch export locally, not that a Langfuse server indexed it.
+
+Ending work and exporting its evidence are separate steps. Watch the last batch in this sequence:
+
+```mermaid
+sequenceDiagram
+  participant A as SSO script
+  participant C as active rag.answer context
+  participant B as SDK export batch
+  participant D as destination exporter
+  A->>C: open root, retrieve, generation
+  C->>B: generation ends: answer + usage
+  C->>B: root ends: final answer
+  A->>B: finally: flush()
+  B->>D: export ended observations
+  D-->>B: local exporter accepts batch
+  B-->>A: flush returns
+```
+
+Without flush, the script can return a correct answer then exit while evidence is still queued.
+In this run D is memory; in remote mode D is an OTLP sender. A flush returning is not a backend
+query proving storage, and failed/blocked network delivery needs separate diagnosis.
+
+To repeat against a real project, set the three variables in Configure from approved secret
+management and run the same script with `--remote`. It sends only the synthetic SSO data.
+Then find its printed trace ID in the matching project's UI and verify all three observations,
+the parent IDs, output and usage. If no record appears, diagnose credentials, region, tracing
+switch, sampling and exporter failures in that order; a successful answer proves none of those.
+External ingestion remains an explicit credential-dependent gate for this collection.
+
+Continue below to replace the stub with a provider. Keep this local smoke as the context baseline;
+privacy, filtering and multi-project routing are later changes, each with a separate boundary.
+
 ## 🛠️ Install
 
 ```bash
-pip install langfuse
+pip install "langfuse==4.17.0"
 ```
 
 Use `langfuse>=4.14.0,<5` when the application uses propagated prompt linking shown below. Earlier v4 releases can use explicit observation-level `prompt=prompt` linking but do not support `propagate_attributes(prompt=...)`.
@@ -95,62 +159,6 @@ langfuse = Langfuse(
 
 Constructor arguments override environment values for that client instance. In production, prefer environment variables for credentials and deployment-specific settings, and use constructor arguments only when the process intentionally talks to multiple projects or needs test-specific overrides.
 
-## 🔌 Singleton and Multi-Project Use
-
-`get_client()` uses a singleton pattern. In normal single-project services, calling it from many modules returns the same client and avoids duplicate exporters.
-
-```python
-from langfuse import get_client
-
-langfuse = get_client()
-```
-
-Multi-project use is experimental. If more than one project client exists in the same process, pass `public_key` when retrieving a client. Without an explicit project key, the SDK returns a disabled client to avoid cross-project data leakage.
-
-> ⚠️ **Watch out:** In multi-project mode, calling `get_client()` without a `public_key` returns a silently disabled client — traces disappear with no error.
-
-```python
-from langfuse import Langfuse, get_client
-
-Langfuse(public_key="pk-lf-project-a", secret_key="sk-lf-...")
-Langfuse(public_key="pk-lf-project-b", secret_key="sk-lf-...")
-
-project_a = get_client(public_key="pk-lf-project-a")
-project_b = get_client(public_key="pk-lf-project-b")
-```
-
-Prefer separate processes or services for separate tenants/projects unless there is a strong operational reason to multiplex.
-
-The difficult case is third-party OpenTelemetry instrumentation. Those spans do not carry the Langfuse public-key routing attribute, so any span that passes the filter can be processed by every configured project's span processor and sent to every project.
-
-This is unsafe because the integration call has no project key:
-
-```python
-from langfuse import Langfuse
-from langfuse.openai import OpenAI
-
-Langfuse(public_key="pk-lf-project-a", secret_key="sk-a")
-Langfuse(public_key="pk-lf-project-b", secret_key="sk-b")
-
-client = OpenAI()
-client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "project-specific data"}],
-)  # Missing langfuse_public_key: routing is ambiguous.
-```
-
-Carry the intended key on every top-level SDK/integration execution:
-
-```python
-response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "project A data"}],
-    langfuse_public_key="pk-lf-project-a",
-)
-```
-
-For decorators, pass `langfuse_public_key=` to the top-level observed function call. For LangChain, create `CallbackHandler(public_key="pk-lf-project-a")`. Test a deliberately missing-key call and assert it is rejected or absent from every project. If an instrumentation cannot carry the key, isolate projects in separate processes instead of relying on filters to prevent cross-project disclosure.
-
 ## 🛠️ Context Manager Instrumentation
 
 The context manager is the clearest way to instrument production code because parent-child relationships are explicit and automatic.
@@ -194,18 +202,23 @@ def answer_question(question: str, user_id: str, session_id: str) -> str:
                 answer = response.choices[0].message.content or ""
                 usage = response.usage
 
-                generation.update(
-                    output=answer,
-                    usage_details={
-                        "input_tokens": usage.prompt_tokens if usage else 0,
-                        "output_tokens": usage.completion_tokens if usage else 0,
-                    },
-                )
+                generation.update(output=answer)
+                if usage is not None:
+                    generation.update(usage_details={
+                        "input": usage.prompt_tokens,
+                        "output": usage.completion_tokens,
+                    })
+                else:
+                    generation.update(metadata={"usageMissing": True})
 
             root.update(output={"answer": answer})
 
             return answer
 ```
+
+Missing provider usage is unknown, not measured zero. The example records a bounded
+`usageMissing` flag and omits usage when the provider did not supply it. If splitting cached or
+reasoning subtypes later, convert inclusive counts into exclusive buckets as taught in 01.
 
 For new code, set trace input and output on the root observation. Langfuse keeps legacy trace input/output helpers for migration cases, but root observation input/output is the current default pattern.
 
@@ -448,6 +461,27 @@ The SDK can capture inputs and outputs, but your application owns the privacy de
 
 Use per-observation capture controls for sensitive functions, and use export-stage masking for data created by third-party instrumentation.
 
+Before instrumenting a real tool result, project it into an approved bounded schema. The runnable
+[allowlist fixture](../examples/local/langfuse_capture_policy.py) receives nested token/header/body/
+exception data and forwards only catalog-approved document ID/revision plus bounded status:
+
+```bash
+python3 examples/local/langfuse_capture_policy.py
+```
+
+Its expected output is `status=ok`, document `doc_001/r4`, and a PASS line proving the synthetic
+secret and email are absent from the projected representation. Change the catalog to your approved
+source, and disable automatic decorator/wrapper I/O capture so raw arguments cannot bypass the
+projection. Updating a manual observation with safe output does not undo earlier automatic capture.
+The fixture validates this one application-owned carrier; third-party spans and exception/log paths
+still require export masking and independent destination inspection.
+
+The email-regex patch below is an explanatory SDK masking API example, **not a complete privacy
+policy**. It handles string attributes only and does not remove tokens, arrays, serialized JSON,
+exception content or unexpected attribute keys. Production masking must cover the actual typed
+carriers and prevent raw diagnostic logging; never approve it merely because one email was replaced.
+
+
 ```python
 import re
 from typing import Optional
@@ -495,6 +529,13 @@ langfuse = Langfuse(
 ```
 
 Filtering is powerful but dangerous. Dropping a parent span can create orphaned observations, and dropping non-LLM business spans can remove the context that explains a generation.
+
+To keep AI work plus its root/business ancestors while excluding operational siblings,
+use the explicit [rooted GenAI view](03_otel_ingestion_and_mapping.md#keep-a-rooted-genai-view-instead-of-operational-subtrees).
+That section demonstrates the same policy with a Collector, with this SDK's
+`should_export_span`, and with a raw OTel exporter wrapper. A shared provider can send
+all spans to APM and only the selected view to Langfuse; a separate provider is not
+required for destination filtering.
 
 ## 🧪 Scores in Application Code
 
@@ -617,6 +658,78 @@ Sampling implications:
 | Multi-service | Gateway root -> HTTP trace context/baggage -> downstream child observations | Requires HTTP instrumentation or manual W3C propagation. |
 | Experiment runner | Dataset item -> task trace -> evaluator scores -> dataset run | Use deterministic score IDs and stable run names. |
 
+## 🔌 Singleton and Multi-Project Use
+
+`get_client()` uses a singleton pattern. In normal single-project services, calling it from many modules returns the same client and avoids duplicate exporters.
+
+```python
+from langfuse import get_client
+
+langfuse = get_client()
+```
+
+Multi-project use is experimental. If more than one project client exists in the same process, pass `public_key` when retrieving a client. Without an explicit project key, the SDK returns a disabled client to avoid cross-project data leakage.
+
+> ⚠️ **Watch out:** In multi-project mode, calling `get_client()` without a `public_key` returns a silently disabled client — traces disappear with no error.
+
+```python
+from langfuse import Langfuse, get_client
+
+Langfuse(public_key="pk-lf-project-a", secret_key="sk-lf-...")
+Langfuse(public_key="pk-lf-project-b", secret_key="sk-lf-...")
+
+project_a = get_client(public_key="pk-lf-project-a")
+project_b = get_client(public_key="pk-lf-project-b")
+```
+
+Prefer separate processes or services for separate tenants/projects unless there is a strong operational reason to multiplex.
+
+The difficult case is third-party OpenTelemetry instrumentation. Those spans do not carry the Langfuse public-key routing attribute, so any span that passes the filter can be processed by every configured project's span processor and sent to every project.
+
+This is unsafe because the integration call has no project key:
+
+```python
+from langfuse import Langfuse
+from langfuse.openai import OpenAI
+
+Langfuse(public_key="pk-lf-project-a", secret_key="sk-a")
+Langfuse(public_key="pk-lf-project-b", secret_key="sk-b")
+
+client = OpenAI()
+client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "project-specific data"}],
+)  # Missing langfuse_public_key: routing is ambiguous.
+```
+
+Carry the intended key on every top-level SDK/integration execution:
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "project A data"}],
+    langfuse_public_key="pk-lf-project-a",
+)
+```
+
+For decorators, pass `langfuse_public_key=` to the top-level observed function call. For LangChain, create `CallbackHandler(public_key="pk-lf-project-a")`. Test a deliberately missing-key call and assert it is rejected or absent from every project. If an instrumentation cannot carry the key, isolate projects in separate processes instead of relying on filters to prevent cross-project disclosure.
+
+Multi-project processors create an additional trust boundary. An unkeyed third-party span can
+reach both processors even though your application intended one destination:
+
+```mermaid
+flowchart LR
+  S["unkeyed GenAI span"] --> A["project A processor"]
+  S --> B["project B processor"]
+  A --> LA["project A export"]
+  B --> LB["project B export"]
+  K["SDK operation keyed A"] --> A
+```
+
+The project key is routing evidence, not tenant authorization. Separate processes prevent this
+processor fan-out because each process has one project's exporter. A filter test must cover a
+missing-key span, not only the happy keyed call.
+
 ## 🔍 Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -653,3 +766,44 @@ Sampling implications:
 - SDK instrumentation: <https://langfuse.com/docs/observability/sdk/instrumentation>
 - SDK advanced features: <https://langfuse.com/docs/observability/sdk/advanced-features>
 - Python SDK reference: <https://python.reference.langfuse.com/langfuse>
+
+## Retain the implementation reasoning
+
+- Active observation context creates parentage; the same function names alone cannot join work.
+- End each scope to finalize payloads, then flush short-lived processes to export the final batch.
+- Inspect exported IDs locally and query the matching project for a separate remote-delivery proof.
+- Suppress sensitive capture before instrumentation; test routing/filtering as independent changes.
+
+**Q: A new thread starts retrieval after the root has closed. Does its name make it a child?**
+
+<details><summary>Answer</summary>
+
+No. Parentage is decided from context at creation. Capture and attach the intended OTel context
+across the thread boundary, or explicitly parent the observation. Verify the actual parent ID.
+A root that has ended can still correlate later work, but that is a deliberate lifecycle choice.
+
+</details>
+
+**Q: The answer prints but remote trace lookup misses it. Is model success proof of telemetry delivery?**
+
+<details><summary>Answer</summary>
+
+No. Provider work and exporter work are separate. Check ended/queued spans, final flush, export
+failures and the selected project. Auth success alone also does not prove ingestion/indexing.
+
+</details>
+
+**Try it:** Extend the smoke with a `guardrail` child that rejects an answer missing `doc_001`.
+Leave the provider stub unchanged; then remove its citation. Keep the guardrail inside the root,
+record a bounded pass/fail result, and change the expected exported name set. Hint: the guardrail
+must exist in both outcomes, because checking was attempted in both.
+
+<details><summary>Worked solution</summary>
+
+After the generation block, open `start_as_current_observation(name="guardrail.citation",
+as_type="guardrail")`; compute `passed = "[doc_001]" in answer`; update output with
+`{"passed": passed}`. Add `guardrail.citation` to the assertion's expected set and parent checks.
+Both runs export four observations with the same root parent. Only the guardrail output changes;
+this check establishes citation presence, not factual accuracy.
+
+</details>

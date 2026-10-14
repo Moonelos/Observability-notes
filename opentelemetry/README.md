@@ -17,6 +17,8 @@ This section is a beginner-to-production guide. It starts with the mental model,
 | [05_custom_metrics_alerting.md](05_custom_metrics_alerting.md) | Custom metric design, Prometheus-style export, SLOs, alerts, and runbooks. |
 | [06_genai_and_llm_observability.md](06_genai_and_llm_observability.md) | Current GenAI semantic conventions and how they apply to LLM and agent systems. |
 
+**First-time prerequisite:** basic Python and shell use. Read 01 then 02 for the executable trace simulation and local `/chat` service. Stop after 02 for a local baseline; take 04 for remote propagation, 05 for aggregate querying and alerts, 03 plus deployment for production policy. Take 06 when model attempts/streaming need domain instrumentation.
+
 ## 📐 When To Use OpenTelemetry Directly
 
 Use raw OpenTelemetry instrumentation when:

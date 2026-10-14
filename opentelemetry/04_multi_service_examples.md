@@ -22,6 +22,48 @@ Auto-instrumentation can handle the first two for supported libraries. It does
 not invent application baggage and it does not turn baggage into span
 attributes.
 
+## Run the same request through three processes
+
+Prerequisites: [01 concepts](01_concepts.md) and [02 Python baseline](02_python_instrumentation.md). A process is one running application with its own provider/resource; an HTTP request crosses a process boundary, so current Python context cannot cross it directly. The client serializes context into headers and the receiver reconstructs it before starting its SERVER span.
+
+Use [the complete local lab](../examples/README.md#run-the-local-baselines), whose files live in `examples/local`. Its deterministic agent and retriever use real FastAPI/HTTPX instrumentation and the OTel SDK. Langfuse helpers are an API convenience over that SDK; console export is the controlled destination, with no external credentials.
+
+From the repository root after installing that lab's dependencies:
+
+```bash
+python examples/local/verify_local.py
+LAB_DISABLE_TIER=1 python examples/local/verify_local.py
+```
+
+The runner starts `gateway_service.py`, `retrieval_service.py`, `agent_service.py` and the separate RAG fixture on loopback ports 8080–8083; waits for readiness; emits a request; flushes; checks exports; and stops every process it started. Those ports must be free. Its first run proves shared trace identity, allowed tier enrichment and fail-closed authentication. The changed run removes only the retrieval span processor, then proves the trace remains connected while the retrieval business span lacks the tier attribute.
+
+To inspect the same interaction manually, start the named services using [the gateway/agent commands](../examples/02_multi_service_agent.md#run-the-complete-local-services) and add retrieval at port 8082 with `RETRIEVAL_SERVICE_URL=http://127.0.0.1:8082` on the gateway. Use a fresh request after changing any process.
+
+Watch the two independent pieces of state:
+
+```mermaid
+sequenceDiagram
+    participant U as user-a
+    participant G as gateway-service
+    participant R as retrieval-service
+    participant A as agent-service
+    U->>G: POST /chat, verified local-user-token
+    Note over G: SERVER exists before handler authenticates
+    G->>G: discard external baggage, set trusted enterprise
+    G->>R: POST /search, CLIENT traceparent + enterprise baggage
+    Note over R: extract before SERVER, on_start copies tier
+    R->>R: vector_db.query inherits SERVER context
+    R-->>G: document_ids=doc_001
+    G->>A: POST /run, same trace ID, authenticated gateway
+    A->>A: llm.decide then tool.lookup_account then llm.decide
+    A-->>G: answer, steps=2
+    G-->>U: answer plus trace_id
+```
+
+The gateway SERVER already exists when identity becomes trustworthy. Writing enterprise to that existing span covers this first span; attaching trusted baggage covers later children and outbound injection. Retrieval sees the carrier before it starts its SERVER, so its `TierProcessor.on_start` can copy the tier immediately. This processor affects exported attributes; traceparent extraction independently controls parentage. The runner deliberately sends attacker-supplied baggage and verifies the server-selected enterprise tier wins. Neither baggage nor trace IDs authorize account access: the internal token fixture is bound to account-a, and caller payload cannot select account-b.
+
+The deterministic tool loop isolates propagation from paid/nondeterministic inference. [The agent continuation](../examples/02_multi_service_agent.md) explains decision steps, idempotent in-flight ownership and replacing the fake model. Retain the parent/link delayed-work policy below as a separate lifecycle choice; this synchronous HTTP lab does not claim durable queue recovery.
+
 ## 🧭 Three Separate Mechanisms
 
 ### Parent spans inside one process
@@ -837,6 +879,25 @@ Requirements for a custom carrier:
 - it must not expose tracing metadata to user-visible payloads;
 - it should survive serialization and broker hops.
 
+## Follow a durable carrier through a lifecycle boundary
+
+The database handoff below is a protocol trace, not a complete database implementation. It combines earlier carrier serialization with the new-root link policy already taught in 01:
+
+```mermaid
+sequenceDiagram
+    participant S as scheduler span
+    participant DB as task row and carrier
+    participant P as worker poll span
+    participant W as linked execution root
+    S->>DB: atomic commit payload plus injected carrier
+    P->>DB: claim committed task under transaction
+    DB-->>P: task payload plus producer context
+    P->>W: start with empty parent, link to stored producer
+    W->>DB: perform work then commit completion
+```
+
+The commit makes payload and correlation visible together; a worker cannot observe a task with missing context from a separate unfinished write. Polling is worker infrastructure, so the new execution root does not inherit the poll span. Its explicit link refers to the scheduler context retained in the row. This topology says nothing about exactly-once execution: a worker crash after a side effect and before completion still needs application idempotency and ownership fencing, as developed in the agent example.
+
 ## 🌐 Propagator Configuration
 
 All services should agree on propagators. Common setting:
@@ -880,23 +941,9 @@ Use `app.*` when the context is generally useful. Use `langfuse.*` when you are
 intentionally mapping fields into Langfuse. Do not put raw prompts or documents
 in baggage.
 
-## 🛠️ End-To-End Local Test
+## End-to-end observations and their limits
 
-To verify propagation locally:
-
-1. Start a Collector with a debug or console exporter.
-2. Run gateway, retrieval, and agent services with the same OTLP endpoint.
-3. Send one request with a known `session.id`.
-4. Inspect the exported spans.
-
-Expected:
-
-- all service spans share one `trace_id`;
-- gateway client spans have matching downstream server spans;
-- `service.name` differs by service;
-- `session.id` appears only if copied from baggage;
-- logs inside the request include the same trace ID;
-- metrics have route/model/outcome labels but not trace ID or user email.
+Use the runner above as the canonical local composition. A shared trace ID alone proves grouping; also compare each remote SERVER parent ID to its HTTPX CLIENT span ID to establish the actual call relationship. Resources must name different services, and the tier must appear only where a processor/helper explicitly copies it. Console export proves the SDK payload, not Collector or external backend delivery. Use the deployment canary in the deployment guide for those later boundaries.
 
 ## 🔍 Troubleshooting Broken Traces
 
@@ -982,3 +1029,39 @@ Queue jobs have an unexpected trace shape:
 - [HTTPX instrumentation](https://opentelemetry-python-contrib.readthedocs.io/en/latest/instrumentation/httpx/httpx.html)
 
 **Next**: [Custom Metrics and Alerting](05_custom_metrics_alerting.md)
+
+## Recap
+
+- Context travels in HTTP headers because processes cannot share Python execution context.
+- Extract before starting a remote SERVER span to preserve the caller relationship.
+- Authenticate before adding trusted business baggage and reject caller-controlled identity.
+- Baggage enrichment and trace propagation are separate; one can work while the other fails.
+- Delayed work can continue a trace or start a linked trace under an explicit lifecycle policy.
+
+## Check yourself
+
+**Remove retrieval's TierProcessor but keep HTTP instrumentation. What changes?**
+
+<details><summary>Answer</summary>
+
+Trace IDs and remote parentage stay connected because headers are still injected/extracted. The tier remains transported context but no longer becomes a retrieval span attribute. Missing attributes are not proof of broken trace propagation.
+
+</details>
+
+**A public caller sends enterprise baggage and account-b. Which account may the agent read?**
+
+<details><summary>Answer</summary>
+
+Only account-a in this lab, derived from the verified gateway identity. The public request schema carries no account selection, and the gateway clears external baggage. Telemetry context cannot grant access.
+
+</details>
+
+## Try it
+
+Run the changed processor case above, then locate the retrieval business span and gateway business span in the exported output. Leave the diagnosis to yourself before opening the answer.
+
+<details><summary>Worked solution</summary>
+
+Retrieval lacks app.tenant.tier but still shares the gateway trace ID. Restore processor registration, restart that process, and send a fresh request. The attribute returns without changing traceparent ownership.
+
+</details>

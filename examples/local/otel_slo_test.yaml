@@ -1,0 +1,52 @@
+rule_files:
+- otel_slo_rules.yaml
+evaluation_interval: 1m
+tests:
+- interval: 1m
+  input_series:
+  - series: http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="good"}
+    values: 0+184x30
+  - series: http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}
+    values: 0+16x30
+  alert_rule_test:
+  - eval_time: 1m
+    alertname: ChatApiSloFastBurn
+    exp_alerts: []
+  - &id001
+    eval_time: 20m
+    alertname: ChatApiSloFastBurn
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        service: chat-api
+      exp_annotations:
+        summary: chat-api is rapidly consuming its 30-day error budget
+        runbook: Check bad-event mix, release, dependencies, and representative traces.
+- interval: 1m
+  input_series:
+  - series: http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="good"}
+    values: 0+188x30
+  - series: http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}
+    values: 0+12x30
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: ChatApiSloFastBurn
+    exp_alerts: []
+- interval: 1m
+  input_series:
+  - series: http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="good"}
+    values: 0+188x54 10336+184x6
+  - series: http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}
+    values: 0+12x54 664+16x6
+  alert_rule_test:
+  - eval_time: 60m
+    alertname: ChatApiSloFastBurn
+    exp_alerts: []
+- interval: 1m
+  input_series:
+  - series: http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="good"}
+    values: 0+184x10 0+184x20
+  - series: http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}
+    values: 0+16x10 0+16x20
+  alert_rule_test:
+  - *id001

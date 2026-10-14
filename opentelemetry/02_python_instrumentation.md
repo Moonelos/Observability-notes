@@ -55,13 +55,153 @@ loses data. Pick one owner for provider setup.
 These notes mostly use code-based setup because it is easier to reason about in
 application code. A zero-code section appears later in this file.
 
+## Run one complete service before choosing exporters
+
+Prerequisites: basic Python, a terminal, and the trace/context model in 01. Run commands from the repository root. This local lab needs no Collector, database, model provider, or credentials. It owns provider setup directly; launch it with plain Uvicorn.
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install 'fastapi>=0.115,<1' 'uvicorn>=0.30,<1' 'opentelemetry-sdk>=1.39,<2' 'opentelemetry-instrumentation-fastapi>=0.60b0,<1'
+cd examples/local
+uvicorn chat_app:app --host 127.0.0.1 --port 8080
+```
+
+In another terminal:
+
+```bash
+curl --fail-with-body -sS http://127.0.0.1:8080/chat -H 'content-type: application/json' -d '{"question":"How do I reset SSO?"}'
+```
+
+The response contains an approved stub answer and a 32-character trace ID. The console prints `rag.retrieve` and `POST /chat` with that same ID, different span IDs, and the retrieval span's parent equal to the server span's ID. ASGI may also emit receive/send child spans; those describe protocol work rather than additional retrievals. No question content enters the trace.
+
+The complete file is [chat_app.py](../examples/local/chat_app.py); the source below is the same baseline, not another app to combine with later variants:
+
+```python
+"""Complete console-first FastAPI baseline. Launch from this directory."""
+import logging
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+from opentelemetry import trace, metrics
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor, BatchSpanProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+resource = Resource.create({'service.name': 'chat-api', 'service.instance.id': str(uuid.uuid4()),
+                            'deployment.environment.name': 'development', 'service.version': 'local-lab'})
+provider = TracerProvider(resource=resource)
+if os.getenv('LAB_OTLP_ENDPOINT'):
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=os.environ['LAB_OTLP_ENDPOINT'])))
+else:
+    provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+trace.set_tracer_provider(provider)
+reader = PeriodicExportingMetricReader(ConsoleMetricExporter(), export_interval_millis=60000)
+meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+metrics.set_meter_provider(meter_provider)
+tracer = trace.get_tracer('lab.chat')
+meter = metrics.get_meter('lab.chat')
+requests = meter.create_counter('app.chat.requests', unit='{request}')
+duration = meter.create_histogram('app.chat.duration', unit='s')
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+@asynccontextmanager
+async def lifespan(app):
+    try:
+        yield
+    finally:
+        meter_provider.force_flush()
+        provider.shutdown()
+        meter_provider.shutdown()
+
+app = FastAPI(lifespan=lifespan)
+FastAPIInstrumentor.instrument_app(app, tracer_provider=provider, meter_provider=meter_provider)
+
+class Chat(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+
+@app.post('/chat')
+def chat(body: Chat):
+    started = time.perf_counter()
+    with tracer.start_as_current_span('rag.retrieve', record_exception=False) as span:
+        span.set_attribute('rag.documents.returned', 1)
+        # Product content is returned to the caller, never attached to telemetry.
+        answer = 'Workspace admins reset SSO in Security settings. [doc_001]'
+    current = trace.get_current_span().get_span_context()
+    attrs = {'http.route': '/chat', 'app.outcome': 'success'}
+    requests.add(1, attrs)
+    duration.record(time.perf_counter() - started, attrs)
+    logging.info('retrieved=1 trace_id=%032x span_id=%016x', current.trace_id, current.span_id)
+    return {'answer': answer, 'trace_id': f'{current.trace_id:032x}'}
+```
+
+Follow who creates the parent before examining export:
+
+```mermaid
+sequenceDiagram
+    participant C as curl
+    participant F as FastAPI chat-api
+    participant S as OTel SDK
+    participant E as Console exporter
+    C->>F: POST /chat question=SSO reset
+    F->>S: start SERVER POST /chat
+    F->>S: start rag.retrieve in current context
+    S->>E: end rag.retrieve, parent=SERVER ID
+    F-->>C: answer plus trace_id
+    S->>E: end POST /chat, same trace_id
+```
+
+FastAPI first establishes the server span as current. Retrieval then reads that context and becomes a child. Ending either span triggers export; exporting never chooses its parent. The SDK and the business response therefore have separate success conditions. The log prints IDs read from the same current server context. The application counter increments once per request and its histogram records elapsed seconds; shutdown collects those measurements rather than waiting a full minute. Press Ctrl-C once to stop accepting requests and flush before providers stop.
+
+### Change the destination while preserving the tree
+
+First run a long-lived loopback debug receiver in another terminal. Install the pinned Collector binary using [deployment decisions](deployment/01_deployment_decisions.md); save this complete config as `console-collector.yaml` in `examples/local`:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:19419
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+```
+
+```bash
+otelcol-contrib validate --config console-collector.yaml
+otelcol-contrib --config console-collector.yaml
+```
+
+Port 19419 must be free; if startup reports an address conflict, choose a free loopback port in both the receiver and exporter. Do not send the lab request until your own receiver is running. Keep it running, install the OTLP exporter in the application environment, and restart the app with a full signal URL:
+
+```bash
+python -m pip install 'opentelemetry-exporter-otlp-proto-http>=1.39,<2'
+LAB_OTLP_ENDPOINT=http://127.0.0.1:19419/v1/traces uvicorn chat_app:app --host 127.0.0.1 --port 8080
+```
+
+Only the trace exporter and processor change: the OTLP branch batches completed spans while the console branch exports synchronously for visibility. The resource, server/manual span ownership and context rule stay the same. Keep console metrics until the later metric-export section; setting this lab variable does not switch metrics. If the Collector is stopped, `/chat` still returns its answer while exporter errors appear. Restart the receiver and emit a **new** request: a successful new trace proves restoration, not replay of every lost old span.
+
 ## 🔌 Install Packages
 
 Install only what you use. A typical FastAPI service that emits traces and
 metrics over OTLP/HTTP and correlates logs needs:
 
 ```bash
-pip install opentelemetry-api \
+pip install fastapi uvicorn httpx opentelemetry-api \
   opentelemetry-sdk \
   opentelemetry-exporter-otlp-proto-http \
   opentelemetry-instrumentation-fastapi \
@@ -542,6 +682,7 @@ forks do not configure providers twice.
 from __future__ import annotations
 
 import os
+from uuid import uuid4
 from dataclasses import dataclass
 
 from opentelemetry import metrics, trace
@@ -561,11 +702,15 @@ class OtelHandles:
 
 
 _otel_handles: OtelHandles | None = None
+_otel_shutdown = False
+_instance_id = str(uuid4())
 
 
 def configure_otel() -> OtelHandles:
     global _otel_handles
 
+    if _otel_shutdown:
+        raise RuntimeError("OTel shutdown is terminal; start a new process")
     if _otel_handles is not None:
         return _otel_handles
 
@@ -573,7 +718,7 @@ def configure_otel() -> OtelHandles:
         {
             "service.name": os.environ["OTEL_SERVICE_NAME"],
             "service.version": os.getenv("SERVICE_VERSION", "unknown"),
-            "service.instance.id": os.getenv("HOSTNAME", "local"),
+            "service.instance.id": _instance_id,
             "deployment.environment.name": os.getenv("ENVIRONMENT", "development"),
         }
     )
@@ -622,13 +767,14 @@ def configure_otel() -> OtelHandles:
 
 
 def shutdown_otel() -> None:
-    global _otel_handles
+    global _otel_handles, _otel_shutdown
 
     if _otel_handles is None:
         return
 
     handles = _otel_handles
     _otel_handles = None
+    _otel_shutdown = True
     try:
         handles.tracer_provider.shutdown()
     finally:
@@ -647,7 +793,7 @@ What this does:
 - Signal-specific endpoint variables override the normalized global base and
   are passed through unchanged. Only the global base is normalized before the
   code appends `/v1/traces` or `/v1/metrics`.
-- `shutdown_otel()` clears its stored handles before shutdown, so a repeated call is a no-op. This guide invokes it explicitly from the FastAPI lifespan or a script `finally` block rather than also registering `atexit`.
+- `shutdown_otel()` clears handles and marks shutdown terminal. Repeated shutdown is a no-op; configure after shutdown raises because Python global providers cannot be replaced. Test a fresh lifecycle in another process. Configure once per worker **after** a prefork server forks, rather than inheriting exporter threads. The per-process UUID is shared across signal resources. This guide invokes it explicitly from the FastAPI lifespan or a script `finally` block rather than also registering `atexit`.
 
 ## 🔌 Add Auto-Instrumentation
 
@@ -1441,6 +1587,16 @@ If your production setup module registers global providers, make tests
 idempotent and isolated. Global OTel state is process-wide, so test suites can
 interfere with themselves if they repeatedly configure providers.
 
+## Reproduce process ownership in isolation
+
+The [bootstrap test](../examples/local/verify_bootstrap.py) executes the exact startup module shown above in two fresh interpreters. From the repository root, run:
+
+```bash
+python examples/local/verify_bootstrap.py
+```
+
+It checks repeated configuration returns the same handles, repeated shutdown is harmless, reconfiguration after terminal shutdown raises, resources share one per-process identity, and two independent processes receive different instance IDs. It does not certify exporter/backend delivery. This avoids replacing Python global providers inside one test process, which is not a supported lifecycle.
+
 ## 🔍 Troubleshooting Python Telemetry
 
 No spans:
@@ -1530,3 +1686,39 @@ Named log events look like ordinary logs or appear twice:
   changes.
 - Shutdown flushes telemetry in web apps, workers, jobs, and serverless handlers.
 - Tests do not leak telemetry to production backends.
+
+## Recap
+
+- Configure providers before serving so framework spans have a recorder.
+- FastAPI owns HTTP semantics; manual spans add retrieval meaning under current context.
+- Export destination changes do not change parentage.
+- Measurements aggregate independently of trace sampling and export.
+- Close clients and flush last; provider shutdown is terminal in a process.
+
+## Check yourself
+
+**A request succeeds while OTLP logs connection errors. Was the business operation lost?**
+
+<details><summary>Answer</summary>
+
+The successful response proves the operation ran. Export failures affect telemetry delivery; inspect receiver reachability and send a fresh canary after recovery. Missing traces cannot prove missing business work.
+
+</details>
+
+**Two workers share HOSTNAME. Can it identify both service instances?**
+
+<details><summary>Answer</summary>
+
+No. Each worker is a separate runtime with its own telemetry lifecycle. A process UUID distinguishes them, while service.name stays identical for aggregation.
+
+</details>
+
+## Try it
+
+Add a second local operation `prompt.build` after retrieval, using the existing tracer. Predict its parent before running. Hint: the retrieval context has ended, but the SERVER context is still current.
+
+<details><summary>Worked solution</summary>
+
+Open `with tracer.start_as_current_span("prompt.build", record_exception=False):` after the retrieval block and perform the fake prompt construction inside. Both business spans share the server parent; prompt.build is a sibling, not a retrieval child. Confirm parent IDs in console output.
+
+</details>

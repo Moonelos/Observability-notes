@@ -8,6 +8,98 @@ This chapter explains how to design OpenTelemetry metrics, export them, map
 them into Prometheus-style backends, and turn them into useful alerts for
 distributed systems and LLM applications.
 
+## From one request to a firing decision
+
+Start after [Python instrumentation](02_python_instrumentation.md): the application owns a configured MeterProvider. Before configuring a backend, run the complete [local measurement carrier](../examples/local/otel_slo_measurements.py) from the repository root using the same environment:
+
+```bash
+python examples/local/otel_slo_measurements.py
+```
+
+It prints `PASS one good and one bad event; 503 plus 9s counted once`, using real SDK aggregation with no Collector or provider keys. This worked path uses one custom counter, independent of trace sampling. At the end of each `/chat` request it records exactly one terminal outcome. A failed request that also takes nine seconds contributes one bad event, not two.
+
+```python
+from opentelemetry import metrics
+
+requests = metrics.get_meter("chat-slo").create_counter(
+    "http.server.requests", unit="{request}"
+)
+
+
+def record_request(status_code: int, duration_seconds: float) -> None:
+    requests.add(1, {
+        "http.route": "/chat",
+        "app.slo.result": "bad" if status_code >= 500 or duration_seconds > 8 else "good",
+    })
+```
+
+`record_request(200, 0.4)` increments the good attribute combination. `record_request(503, 9)` increments the bad combination. The SDK maintains two cumulative sums; there is no request ID label. Span attributes do not automatically become metric attributes, which is why this function passes the classification explicitly.
+
+The diagram shows how these sums become the numbers an alert uses; each boundary can independently lose data.
+
+```mermaid
+flowchart LR
+  A[503 after 9 seconds] -->|one bad measurement| S[SDK cumulative counter]
+  S -->|OTLP datapoints| C[Collector name and resource mapping]
+  C -->|http_server_requests_total| P[Prometheus samples]
+  P -->|rate then sum| R[5m and 1h bad ratios]
+  R -->|both burns pass| D[Pending then firing]
+```
+
+The Collector translates the metric name and dotted attribute keys. For the pinned remote-write default this counter becomes `http_server_requests_total`, with `http_route` and `app_slo_result` labels. Resource identity is a separate mapping: by default many resource attributes live on `target_info`, not on every series. Every rule below that filters `service_name` and `deployment_environment_name` requires those resource attributes to be promoted. For this tutorial's deliberately bounded Resource, enable `resource_to_telemetry_conversion.enabled: true`; production should promote only approved keys rather than attaching arbitrary resource fields. Confirm the actual result in the backend before using these selectors. See the [pinned exporter mapping documentation](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.158.0/exporter/prometheusremotewriteexporter/README.md) (checked 2026-10-14).
+
+A faithful backend sample looks like this (exposition excerpt, not Python output):
+
+```text
+http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="good",instance="a"} 920
+http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad",instance="a"} 80
+```
+
+### Turn totals into a rate before combining instances
+
+A cumulative total of 80 bad requests cannot tell us whether the incident happened today or last month. `rate(counter[5m])` uses samples within the last five minutes to estimate events per second, adjusting for counter decreases caused by process restarts and extrapolating to the window edges. For evenly spaced samples spanning exactly 300 seconds with no reset, a bad counter growing from 80 to 160 means `80 / 300 = 0.2667` bad requests/s. If the total grows by 1,000, total throughput is `1000 / 300 = 3.3333` requests/s. Their ratio is `0.08`.
+
+For a reset trace at seconds 0, 150, 300, counter values `100, 160, 20` show 60 events before reset and 20 after: observed corrected increase is 80, not -80. Actual `rate` still depends on sample coverage and extrapolation, so inspect raw samples when diagnosing sparse data. Apply `rate` to each instance before summing; adding raw counters first can conceal one instance's reset behind another's growth. [Prometheus rate semantics](https://prometheus.io/docs/prometheus/latest/querying/functions/#rate) (checked 2026-10-14).
+
+For the single service, `sum(rate(...))` drops all instance and outcome labels, yielding one scalar-like vector element on each side of the division. Numerator and denominator now match. To preserve route, use `sum by (http_route)` on both sides. Retaining `app_slo_result` on only the numerator causes unmatched label sets and an empty division result; PromQL does not infer that you meant to ignore it. The histogram alert later uses explicit `and on (...)` to match a quantile vector with a count vector on their common identifying labels.
+
+### Compute burn, then maintain alert state
+
+The 99.5% SLO permits `1 - 0.995 = 0.005` bad events. An observed bad ratio of `0.08` spends that allowance `0.08 / 0.005 = 16` times faster than the target pace. At constant traffic, that pace consumes a 30-day budget in `30 / 16 = 1.875` days. This is a rate comparison, not a prediction that future traffic stays constant.
+
+The fast rule below requires **both** 5m and 1h burn above 14.4, plus minimum request counts. Compare two histories, assuming guards pass:
+
+| Last 5m | Last 1h | Computation | Expression result |
+| --- | --- | --- | --- |
+| 80 bad / 1,000 total | 960 bad / 12,000 total | 16x and 16x | true |
+| 80 bad / 1,000 total | 720 bad / 12,000 total | 16x and 12x | false |
+
+The second history has a recent burst but less sustained damage. `for: 2m` cannot make it pass: it waits only after the entire expression is true. Each rule evaluation checks fresh rolling windows; they are different from the persistence timer.
+
+The state diagram follows the first history into an actual firing decision.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Inactive
+  Inactive --> Pending: both burns above 14.4 and traffic guards pass
+  Pending --> Firing: same alert label set remains true for 2m
+  Pending --> Inactive: expression false or missing
+  Firing --> Inactive: expression false or missing
+```
+
+With one-minute evaluation, true at 12:00 starts pending, true at 12:01 remains pending, and true at 12:02 fires. False at 12:01 discards the first pending interval; a new true result at 12:02 starts again. Missing data also does not prove health: this impact alert stops being active, so separately monitor missing application series and Collector health. Firing is a Prometheus state; Alertmanager still groups, routes and suppresses notifications according to its configuration. [Alert state documentation](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/) (checked 2026-10-14).
+
+The complete rules are also [otel_slo_rules.yaml](../examples/local/otel_slo_rules.yaml); their synthetic input suite is [otel_slo_test.yaml](../examples/local/otel_slo_test.yaml). With Prometheus 3.15.0's `promtool` on your PATH, run from the repository root:
+
+```bash
+promtool check rules examples/local/otel_slo_rules.yaml
+promtool test rules examples/local/otel_slo_test.yaml
+```
+
+The first command reports six valid rules, and the second reports `SUCCESS`. Fixtures cover 16x sustained firing, 12x suppression, a recent 16x burst whose long-window burn remains below the threshold, an early evaluation that cannot yet fire, and restarting counters whose error ratio remains correct. These execute rule evaluation; they do not prove live backend ingestion. For that separate boundary, [the local signal test](../examples/local/otel_collector_signal_test.py) records a real SDK `llm.tokens` counter, exports OTLP to Contrib 0.158.0 and scrapes `llm_tokens_total` with actual route/token/resource labels. The scrape exporter shares translation conventions but is not a remote-write backend delivery test.
+
+You can now read the full recording and alert rules below as transformations of these measurements. The later variants change the operational question, while preserving the need for correct labels, sufficient traffic and a persistence policy.
+
 ## 🧭 Metric Mental Model
 
 OpenTelemetry metrics flow like this:
@@ -200,7 +292,8 @@ guardrail_blocks = meter.create_counter(
 def run_tool(tool_name: str, args: dict) -> dict:
     outcome = "success"
     try:
-        return tools[tool_name](**args)
+        tool = tools[tool_name]
+        return tool(**args)
     except Exception:
         outcome = "error"
         raise
@@ -249,6 +342,21 @@ In Prometheus-style backends, histograms usually become bucket time series. Make
 sure buckets match the thing being measured. A 10-second LLM latency histogram
 needs different buckets from a 50-millisecond cache lookup histogram.
 
+### Reconstruct a distribution before querying its percentile
+
+Suppose ten `/chat` model calls take `1, 1, 1, 2, 2, 3, 4, 5, 7, 9` seconds. Choose explicit bounds `2, 4, 8`; the OTLP histogram's disjoint counts are `5, 2, 2, 1`. The remote-write classic representation becomes cumulative buckets:
+
+| Prometheus `le` | Count | Interpretation |
+| --- | --- | --- |
+| 2 | 5 | Five calls took at most two seconds. |
+| 4 | 7 | Those five plus two calls in (2,4]. |
+| 8 | 9 | Those seven plus two calls in (4,8]. |
+| +Inf | 10 | All calls, including the nine-second call. |
+
+`_count` is 10 and `_sum` is 35 seconds. The mean is 3.5s, yet one user waited 9s. To estimate p90, locate rank `0.90 * 10 = 9`: it lies at the top of the (4,8] bucket, so classic linear interpolation estimates 8s. The observed ninth value was 7s; bucket aggregation discarded that exact location. At p95 the rank falls in +Inf, so the classic estimate is the highest finite boundary, 8s, also missing the nine-second tail. Choose boundaries that cover meaningful latency ranges; a percentile is an estimate constrained by those boundaries, not a recovered raw observation.
+
+The query takes `rate` per bucket series and then `sum by (le, ...)` to combine instance populations. Retaining `le` preserves the cumulative distribution. Dropping it first would add nested counts together and leave nothing for `histogram_quantile` to reconstruct. Averaging each instance's p95 also fails: an idle instance and a busy instance would receive equal weight despite serving different populations. The combined bucket population gives each request its actual weight. [Prometheus histogram quantile behavior](https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile) (checked 2026-10-14).
+
 ## 📤 Export Patterns
 
 Most teams export metrics through OTLP to a Collector and then to a metrics
@@ -278,8 +386,9 @@ processors:
 
 exporters:
   prometheus_remote_write:
-    http:
-      endpoint: https://prometheus.example.com/api/v1/write
+    endpoint: https://prometheus.example.com/api/v1/write
+    resource_to_telemetry_conversion:
+      enabled: true
 
 service:
   pipelines:
@@ -921,3 +1030,38 @@ Alert did not fire:
 - Alerts include runbooks and useful filters.
 - LLM systems track latency, errors, tokens, tool behavior, retrieval health, and quality.
 - Quality alerts distinguish paging signals from ticket/dashboard signals.
+
+
+## Cardinality limits preserve totals, not every dimension
+
+A cardinality limit caps the number of attribute combinations a supported SDK retains for one metric stream. Suppose an approved route dimension normally has two values, but a bug adds arbitrary user IDs. A synchronous instrument implementing the specification folds measurements beyond its capacity into a stream marked `otel.metric.overflow=true`. That overflow aggregate has lost the original route/outcome combinations. Global counts remain accountable, while a query filtered to `app_slo_result="bad"` can exclude the overflow events and report a falsely healthy ratio. For example 100 routed good events plus 20 bad events folded into overflow give a global total of 120, but the bad selector returns zero.
+
+Do not “fix” this by calling every overflow event bad: its classification is unknown. Alert separately on overflow, remove the unbounded attribute or restrict it with a View before aggregation, and validate each SLO's numerator and denominator under load. Changes cannot reconstruct lost historic labels. The [SDK cardinality specification](https://opentelemetry.io/docs/specs/otel/metrics/sdk/#cardinality-limits) is the contract; availability varies by language and release (checked 2026-10-14). The verified Python 1.45.1 View signature in this collection has no cardinality-limit argument. Do not paste another language's setting into it or claim that this Python lab demonstrated overflow. Use bounded application labels and attribute filtering now; treat cap configuration and overflow export as an upgrade gate requiring a supported SDK and load test. See [current cardinality landscape](https://opentelemetry.io/blog/2026/cardinality-limits-in-opentelemetry/) for implementation context.
+
+## Recap and practice
+
+The application records one explicit SLO result per request. Export mapping turns those measurements and selected resource keys into labels. `rate` handles each counter's restart before `sum` combines instances; matching labels then makes the ratio meaningful. Paired windows establish both recent and sustained burn, while `for` maintains alert state. Histogram boundaries and overflow limit what later queries can recover.
+
+### Check yourself
+
+1. 5m burn is 16x and 1h burn is 12x. Traffic guards pass. When does the fast rule fire?
+2. Why does `_bucket{le="8"}=9` not mean nine requests took exactly eight seconds?
+3. Your Resource has `service.name`, but every `service_name` selector returns no data. What must you inspect?
+
+<details><summary>Reasoned answers</summary>
+
+1. It never enters pending: the 1h value does not exceed 14.4. Waiting two minutes cannot repair a false expression.
+2. The bucket is cumulative: nine requests took at most eight seconds. Their exact values are discarded; interpolated quantiles reflect that uncertainty.
+3. Inspect actual exported labels and mapping. The resource field may be on `target_info` rather than promoted to the counter. Enable the approved promotion or write the deliberate join; an alert annotation cannot filter or add input labels.
+
+</details>
+
+### Try it: restart and recovery
+
+Two instances expose request counters. A's samples at 0,150,300s are `100,160,20`; B's are `200,260,320`. Compute each corrected increase before summing, then predict the fast rule if 5m burn is 20x, 1h burn is 4x and guards pass. Finally explain what happens to a pending alert if the expression becomes empty before its two minutes elapse.
+
+<details><summary>Worked solution</summary>
+
+A contributed `60+20=80`, B contributed `120`, totaling 200 observed events; raw endpoint subtraction would produce only `340-300=40` and hide A's reset. Prometheus may extrapolate around sample edges; these fully covered synthetic points illustrate the reset correction. The fast expression is false because 4x is below 14.4, despite the short burst. Empty evaluation removes the alert's pending state. Monitor missing telemetry independently because silence does not demonstrate recovery.
+
+</details>

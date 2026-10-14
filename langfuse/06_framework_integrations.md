@@ -2,6 +2,12 @@
 
 Last verified against official Langfuse and OpenTelemetry documentation on 2026-07-24.
 
+Role: implementation for readers already using their selected framework/provider. Read
+[SDK context/lifecycle](02_python_sdk_v4.md) first; this chapter teaches adapter ownership rather
+than LangChain or LiteLLM programming. The local SDK smoke is the common context baseline.
+Provider/framework calls below need their named packages, credentials and configured project;
+they are integration examples, with external execution gates retained explicitly.
+
 ## 🧭 Mental Model
 
 Use framework integrations when your application already relies on an LLM framework, model SDK, gateway, or auto-instrumentation layer. Use manual SDK instrumentation when you need exact trace shape and business-specific observations.
@@ -98,7 +104,7 @@ Langfuse integrates with LangChain through LangChain callbacks. The callback cap
 Install:
 
 ```bash
-pip install langfuse langchain langchain_openai langgraph
+pip install "langfuse==4.17.0" "langchain>=1,<2" "langchain-openai>=1,<2" "langgraph>=1,<2"
 ```
 
 Basic usage:
@@ -193,7 +199,7 @@ The OpenAI Python integration is a drop-in wrapper. It works with OpenAI and Azu
 Install:
 
 ```bash
-pip install langfuse openai
+pip install "langfuse==4.17.0" "openai>=1.92,<3"
 ```
 
 Switch imports:
@@ -286,6 +292,28 @@ Layered explanation:
 - Production implications: wrappers are fast to adopt, but they only see model calls; add manual spans for retrieval, policy, routing, and persistence.
 - Common mistakes: forgetting to handle empty streaming chunks that carry usage, assuming beta APIs are fully supported, and using the wrapper plus manual generation spans for the same call.
 
+### See which actor owns the generation
+
+For a direct call, the wrapper surrounds the actual provider operation inside the product root:
+
+```mermaid
+sequenceDiagram
+  participant A as application / support.answer root
+  participant W as Langfuse OpenAI wrapper
+  participant P as model provider
+  participant L as Langfuse exporter
+  A->>W: approved SSO messages under active root
+  W->>P: one completion request
+  P-->>W: answer + usage 820 / 164
+  W->>L: one generation, parent support.answer
+  W-->>A: answer
+  A->>L: root output and business observations
+```
+
+The wrapper owns the one model receipt; the app owns the task and retrieval/guardrail evidence.
+A manual `generation` around that wrapped call would add a second receipt for the same provider
+operation. Use a generic business span around framework work when you need extra context.
+
 ## 🧩 LiteLLM Proxy
 
 LiteLLM Proxy can log all model calls through a central gateway to Langfuse using the `langfuse_otel` callback.
@@ -325,6 +353,29 @@ Use this path when:
 If the application already uses the Langfuse SDK or OpenTelemetry exporter directly, avoid double-instrumenting the same model call through both the app and the proxy unless you intentionally want both views.
 
 > ⚠️ **Watch out:** Double-instrumenting a model call (e.g., both app SDK and LiteLLM proxy) produces duplicate generations in Langfuse, inflating token counts and making cost analytics unreliable.
+
+The proxy adds a network boundary, so correlation metadata must reach another process:
+
+```mermaid
+sequenceDiagram
+  participant A as application / product root
+  participant P as LiteLLM Proxy
+  participant M as model provider
+  participant L as Langfuse
+  A->>P: model request + supported correlation metadata
+  P->>M: one provider request
+  M-->>P: answer + usage
+  P->>L: langfuse_otel generation
+  P-->>A: answer
+  A->>L: root + retrieval/tool observations
+```
+
+The last arrow supplies product evidence absent from the proxy. Do not assume a trace ID alone
+establishes parentage: test the proxy's supported trace/parent metadata and compare IDs in the
+resulting tree. If that path cannot preserve parent IDs, document separate correlated traces
+rather than claiming a nested tree. A second app-side wrapper generation creates two charge-bearing
+observations even though M received one request. Diagnose inflated usage by counting provider
+operations and generations before tuning sampling or cost prices.
 
 Lifecycle:
 
@@ -428,3 +479,43 @@ Rules:
 - OpenAI Python integration: <https://langfuse.com/integrations/model-providers/openai-py>
 - LiteLLM Proxy integration: <https://langfuse.com/integrations/gateways/litellm>
 - OpenTelemetry integration: <https://langfuse.com/integrations/native/opentelemetry>
+
+## Retain the integration boundary
+
+- The app creates the product root; one adapter owns each actual provider-generation receipt.
+- Callbacks/wrappers inherit active context; a proxy additionally needs supported network correlation.
+- Duplicate capture inflates apparent token work even when each observation contains correct usage.
+- Validate streaming final usage, errors, parent IDs, privacy and flush for the exact locked integration.
+
+**Q: A LangChain callback and a manual generation both record the same call. Why can a richer tree mislead cost analysis?**
+
+<details><summary>Answer</summary>
+
+Both receipts describe one provider operation. If both carry usage, aggregation counts the tokens
+twice. Keep the product/business root generic and let one callback/wrapper own the generation.
+
+</details>
+
+**Q: App and proxy traces share an ID, but proxy generation parent is absent. Is the intended nested tree proven?**
+
+<details><summary>Answer</summary>
+
+No. Shared identity correlates records, but parentage also needs the parent ID. Check supported
+proxy metadata and receiving behavior with a staging call. Document correlation separately when
+that integration cannot carry the complete parent relationship.
+
+</details>
+
+**Try it:** Add trusted user/session scope around the supplied callback workflow without adding
+another generation. State the expected hierarchy and which fields you would inspect.
+
+<details><summary>Worked solution</summary>
+
+Open a generic product root, use `propagate_attributes(user_id=..., session_id=...)` with approved
+internal IDs, and invoke the callback-enabled chain inside that scope. Update root output, retain
+trace ID, and flush on script exit. Callback-generated chain/model observations share the root's
+trace; check their actual parent hierarchy (the generation may nest under a callback chain), and
+ensure user/session fields exist on relevant observations. Do not demand every generation be a
+direct child when the framework legitimately inserts a chain parent.
+
+</details>

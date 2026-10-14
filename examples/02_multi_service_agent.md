@@ -12,6 +12,34 @@ This example has:
 
 Use bootstrap profile A from [README.md](README.md) in both processes. Each process initializes the Langfuse trace provider/exporter and OTLP metric reader before instrumenting FastAPI or HTTPX. Set a different `OTEL_SERVICE_NAME` in each process and the same `LANGFUSE_RELEASE` / `LANGFUSE_TRACING_ENVIRONMENT` deployment values.
 
+## Run the complete local services
+
+After [the lab setup](README.md#run-the-local-baselines), run these in separate terminals from `examples/local`. Tokens below are public loopback fixture values, not production credentials. The internal token is bound by the verifier to account-a; a client-controlled account field or baggage cannot expand it.
+
+```bash
+OTEL_SERVICE_NAME=agent-service INTERNAL_AGENT_TOKEN=local-gateway-token uvicorn agent_service:app --host 127.0.0.1 --port 8081
+```
+
+```bash
+OTEL_SERVICE_NAME=gateway-service LAB_PUBLIC_TOKEN=local-user-token INTERNAL_AGENT_TOKEN=local-gateway-token AGENT_SERVICE_URL=http://127.0.0.1:8081 uvicorn gateway_service:app --host 127.0.0.1 --port 8080
+```
+
+```bash
+curl --fail-with-body -sS http://127.0.0.1:8080/answer -H 'authorization: Bearer local-user-token' -H 'content-type: application/json' -d '{"question":"How do I reset SSO?"}'
+```
+
+Expect `steps=2`, `stop_reason=final_answer`, and a trace ID shared by the gateway, HTTPX CLIENT and agent SERVER/business spans. A fixed model decision asks for account tier then returns an answer using that result. These are two decisions and one tool call; steps cannot stand in for tool totals. `/run` without the internal credential returns 401 **before** any model/tool work. The complete modules are [gateway_service.py](local/gateway_service.py), [agent_service.py](local/agent_service.py), [identity.py](local/identity.py), [result_store.py](local/result_store.py), [privacy.py](local/privacy.py), and [observability.py](local/observability.py).
+
+Optional retrieval process, used by the three-service propagation lesson:
+
+```bash
+OTEL_SERVICE_NAME=retrieval-service INTERNAL_AGENT_TOKEN=local-gateway-token uvicorn retrieval_service:app --host 127.0.0.1 --port 8082
+```
+
+Restart the gateway with `RETRIEVAL_SERVICE_URL=http://127.0.0.1:8082` in its environment, then send a fresh request. Stop servers with Ctrl-C; close HTTP clients before flushing exporters. The [verification runner](local/verify_local.py) also starts, tests and cleans up all four local fixtures, including RAG, without real backend keys.
+
+The provider-backed snippets below are continuation excerpts: replace the fixed decision fixture with a reviewed real-provider request and durable tenant-scoped stores. The loopback identity fixture is intentionally one account and one process; it is not a production authentication service.
+
 ## 🏗️ Architecture
 
 ```text
@@ -43,6 +71,7 @@ from uuid import uuid4
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
 from langfuse import propagate_attributes
+from opentelemetry import baggage, context
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from pydantic import BaseModel, Field
@@ -66,15 +95,11 @@ class ServerSession(BaseModel):
     session_id: str
 
 
-def require_identity() -> Identity:
-    # Verify the cookie/JWT and load opaque internal IDs. Never accept these fields
-    # from AnswerRequest.
-    ...
+from identity import require_identity
 
 
-def load_session(identity: Identity = Depends(require_identity)) -> ServerSession:
-    # Resolve or create the conversation in server-side storage and verify ownership.
-    ...
+def load_session(identity=Depends(require_identity)) -> ServerSession:
+    return ServerSession(session_id=identity.session_id)
 
 
 @asynccontextmanager
@@ -140,56 +165,75 @@ async def answer(
     request_id = str(uuid4())
     safe_question = safe_text(body.question, limit=1_000)
 
-    with propagate_attributes(
-        trace_name="agent.answer",
-        user_id=identity.user_id,
-        session_id=session.session_id,
-        environment=os.environ["LANGFUSE_TRACING_ENVIRONMENT"],
-        version=os.getenv("AGENT_VERSION", "agent-dev"),
-        metadata={"entrypoint": "public-api"},
-        tags=["agent", "gateway"],
-        as_baggage=True,
-    ):
-        with langfuse.start_as_current_observation(
-            as_type="span",
-            name="gateway.answer",
-            input={"question": safe_question},
-        ) as span:
-            trace_id = langfuse.get_current_trace_id()
-            try:
-                result = await call_agent(
-                    {
-                        "request_id": request_id,
-                        "question": body.question,
-                        # This is trusted service-to-service input derived from auth. It
-                        # is not baggage and the internal route authenticates the gateway.
-                        "account_id": identity.account_id,
+    # Preserve current trace, discard caller baggage before adding trusted fields.
+    baggage_handle = context.attach(baggage.clear())
+    try:
+        with propagate_attributes(
+            trace_name="agent.answer",
+            user_id=identity.user_id,
+            session_id=session.session_id,
+            environment=os.environ["LANGFUSE_TRACING_ENVIRONMENT"],
+            version=os.getenv("AGENT_VERSION", "agent-dev"),
+            metadata={"entrypoint": "public-api"},
+            tags=["agent", "gateway"],
+            as_baggage=True,
+        ):
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="gateway.answer",
+                input={"question": safe_question},
+            ) as span:
+                trace_id = langfuse.get_current_trace_id()
+                try:
+                    result = await call_agent(
+                        {
+                            "request_id": request_id,
+                            "question": body.question,
+                            # This is trusted service-to-service input derived from auth. It
+                            # is not baggage and the internal route authenticates the gateway.
+                            "account_id": identity.account_id,
+                        }
+                    )
+                except HTTPException as exc:
+                    span.update(level="ERROR", status_message=f"downstream_{exc.status_code}")
+                    raise
+
+                public_result = {
+                    "answer": result["answer"],
+                    "stop_reason": result["stop_reason"],
+                    "steps": result["steps"],
+                    "langfuse_trace_id": trace_id,
+                }
+                span.update(
+                    output={
+                        **public_result,
+                        "answer": safe_text(public_result["answer"]),
                     }
                 )
-            except HTTPException as exc:
-                span.update(level="ERROR", status_message=f"downstream_{exc.status_code}")
-                raise
+                return public_result
+    finally:
+        context.detach(baggage_handle)
 
-            public_result = {
-                "answer": result["answer"],
-                "stop_reason": result["stop_reason"],
-                "steps": result["steps"],
-                "langfuse_trace_id": trace_id,
-            }
-            span.update(
-                output={
-                    **public_result,
-                    "answer": safe_text(public_result["answer"]),
-                }
-            )
-            return public_result
 ```
 
-Retries are safe because `request_id` is generated once and the agent service deduplicates successful results. Do not blindly retry non-idempotent tool calls. For write tools, use an operation-specific idempotency key at the tool boundary or require human confirmation.
+A completion-only cache cannot make overlapping retries safe: both requests can see no result and begin model work. The canonical local `ResultStore` claims a request atomically before execution; followers wait for its completed result, and a changed payload with the same key gets 409. A failed owner leaves failed state and needs a new explicit request. Its state is process-local, so it prevents overlap only within that one running service. The diagram below shows why completed-row uniqueness is weaker.
 
-> 💡 **Key insight:** Generating `request_id` once before retries and deduplicating on the server side makes the whole request safe to replay without executing write operations twice.
+```mermaid
+sequenceDiagram
+    participant G as gateway-service
+    participant A as agent-service claim store
+    participant M as model and tool loop
+    G->>A: request_id=42, payload hash H
+    A->>A: absent to running, owner acquired
+    A->>M: first model decision
+    G->>A: timeout retry id=42 hash H
+    A->>A: running found, follower waits
+    M-->>A: final answer after step 2
+    A->>A: running to completed, notify followers
+    A-->>G: same completed result to both callers
+```
 
-> ⚠️ **Watch out:** Do not replay write-side tool calls automatically — they need a tool-level idempotency key or explicit human confirmation, not the same retry logic as read-only requests.
+Claim acquisition precedes model work, so a follower does not start a second generation. A unique constraint written only after completion would allow both calls to enter the loop. For production use, store a tenant-scoped payload hash, ownership token, state and lease in a durable transaction; renew ownership while working and fence stale owners before publishing completion. Do not automatically rerun unknown-outcome writes when a lease expires. Tool-specific transactional idempotency is required at each write boundary, because process failure can occur after a write and before completion is persisted. This local read-only fixture does not claim durable exactly-once execution.
 
 ## 🛠️ Agent Service
 
@@ -220,6 +264,7 @@ tool_calls = meter.create_counter("agent.tool.calls", unit="{call}")
 tool_failures = meter.create_counter("agent.tool.failures", unit="{call}")
 llm_duration = meter.create_histogram("gen_ai.client.operation.duration", unit="s")
 llm_failures = meter.create_counter("gen_ai.client.operation.failures", unit="{request}")
+token_usage = meter.create_histogram("gen_ai.client.token.usage", unit="{token}")
 
 
 class RunRequest(BaseModel):
@@ -228,18 +273,10 @@ class RunRequest(BaseModel):
     account_id: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,128}$")
 
 
-def require_gateway() -> None:
-    # Verify mTLS identity or the internal bearer token. Reject public callers.
-    ...
+from identity import require_gateway
+from result_store import ResultStore
 
-
-def load_completed_request(request_id: str) -> dict | None:
-    ...
-
-
-def store_completed_request(request_id: str, result: dict) -> None:
-    # Use a unique constraint on request_id and return the existing value on conflict.
-    ...
+store = ResultStore()
 
 
 def search_docs(query: str) -> list[dict]:
@@ -247,9 +284,8 @@ def search_docs(query: str) -> list[dict]:
 
 
 def lookup_account(account_id: str) -> dict:
-    account = account_store.get(account_id)
-    # The model may see only allowlisted categories, not names or billing details.
-    return {"tier": account.tier, "region": account.region}
+    from identity import ACCOUNTS
+    return dict(ACCOUNTS[account_id])
 
 
 TOOLS = [
@@ -331,11 +367,7 @@ app = FastAPI(lifespan=lifespan)
 FastAPIInstrumentor.instrument_app(app)
 
 
-@app.post("/run", dependencies=[Depends(require_gateway)])
-def run_agent(request: RunRequest) -> dict:
-    cached = load_completed_request(request.request_id)
-    if cached is not None:
-        return cached
+def execute_agent(request: RunRequest) -> dict:
 
     messages: list[dict] = [
         {
@@ -360,6 +392,7 @@ def run_agent(request: RunRequest) -> dict:
         for step in range(1, MAX_STEPS + 1):
             steps_used = step
             metric_attrs = {
+                "http.route": "/run",
                 "gen_ai.operation.name": "chat",
                 "gen_ai.provider.name": "openai",
                 "gen_ai.request.model": MODEL,
@@ -390,16 +423,23 @@ def run_agent(request: RunRequest) -> dict:
                     choice = response.choices[0]
                     message = choice.message
                     usage = response.usage
+                    if usage is not None:
+                        token_usage.record(usage.prompt_tokens, metric_attrs | {"gen_ai.token.type": "input"})
+                        token_usage.record(usage.completion_tokens, metric_attrs | {"gen_ai.token.type": "output"})
                     generation.update(
                         output={
                             "finish_reason": choice.finish_reason,
                             "content": safe_text(message.content or ""),
-                            "tool_names": [call.function.name for call in message.tool_calls or []],
+                            "tool_names": [
+                                call.function.name if call.function.name in {"search_docs", "lookup_account"}
+                                else "unsupported_tool"
+                                for call in (message.tool_calls or [])[:5]
+                            ],
                         },
                         usage_details={
-                            "input_tokens": usage.prompt_tokens if usage else 0,
-                            "output_tokens": usage.completion_tokens if usage else 0,
-                        },
+                            "input_tokens": usage.prompt_tokens,
+                            "output_tokens": usage.completion_tokens,
+                        } if usage is not None else None,
                     )
                 except Exception as exc:
                     outcome = "error"
@@ -447,8 +487,17 @@ def run_agent(request: RunRequest) -> dict:
             output={"answer": safe_text(answer), "steps": steps_used},
             metadata={"stopReason": stop_reason},
         )
-        store_completed_request(request.request_id, result)
-        return result
+    return result
+
+
+@app.post("/run")
+def run_agent(request: RunRequest, identity=Depends(require_gateway)) -> dict:
+    if request.account_id != identity.account_id:
+        raise HTTPException(status_code=403, detail="account scope mismatch")
+    return store.run(
+        (identity.tenant_id, request.request_id), request.model_dump(),
+        lambda: execute_agent(request),
+    )
 ```
 
 The account result is no longer discarded: when selected, it becomes a tool message used by the next model decision. A failed search, account lookup, or model call records an error observation and an operational metric. Tool-call metrics are emitted once, after the final outcome is known.
@@ -480,3 +529,39 @@ Alert on signals actually produced here:
 - Collector/exporter loss if using an intermediate metrics Collector.
 
 Thumbs-down and groundedness alerts require score producers and a native Langfuse Monitor or a scheduled Metrics API bridge. They are intentionally not claimed by this example.
+
+## Recap
+
+- Authenticate public and internal boundaries before model/tool work.
+- HTTP propagation connects remote spans; verified identity controls account access.
+- Bound decision iterations independently from the number of tools per decision.
+- An atomic in-flight claim prevents overlapping local retries from doing duplicate work.
+- Durable crash recovery and write-tool idempotency need stronger ownership and transaction boundaries.
+
+## Check yourself
+
+**Both retries see no completed row. Is completion-row uniqueness enough?**
+
+<details><summary>Answer</summary>
+
+No. Work begins before either inserts completion. Claim running state atomically first; followers wait rather than execute.
+
+</details>
+
+**The caller guesses another account ID and supplies it with valid traceparent. Is the account authorized?**
+
+<details><summary>Answer</summary>
+
+No. Trace context is correlation. The verifier's account scope is authoritative; a mismatch is rejected before tool execution.
+
+</details>
+
+## Try it
+
+Using `ResultStore.run`, submit the same key with a different question while the first request is running. Hint: fingerprint the whole payload before checking state.
+
+<details><summary>Worked solution</summary>
+
+The second call raises 409 because its fingerprint differs, even if the first is not yet complete. Reusing a key cannot merge distinct intended operations. The original owner still completes normally.
+
+</details>

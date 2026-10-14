@@ -7,7 +7,7 @@
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-Deployment-326CE5.svg?logo=kubernetes&logoColor=white)](https://opentelemetry.io/docs/platforms/kubernetes/)
 
 Last verified against official OpenTelemetry documentation and upstream
-repositories on 2026-07-24. Examples pin Collector `0.157.0`; re-check the
+repositories on 2026-10-14. Examples pin Collector `0.157.0` and chart `0.168.0`; re-check the
 release, distribution manifest, chart version, and upgrade notes before use.
 
 ---
@@ -55,6 +55,34 @@ hop. Add a separate trace-aware routing and sampling tier before enabling tail
 sampling at scale.
 
 ---
+
+## Milestones and stop points
+
+Readers need basic Python and shell use plus the linked OTel pipeline lesson.
+Chapter 2 provides a bounded local producer→Collector→backend proof; stop there
+for transport practice. Chapters 3–4 bridge Kubernetes concepts and endpoints,
+but their cluster actions require a disposable cluster and intended backend.
+Chapters 5–6 explain capacity, trace ownership, tested local TLS/auth, incident
+triage and release gates. Local tests do not certify cluster production readiness.
+
+## What's changing
+
+Checked 2026-10-14. The historical pair stays fixed so its examples remain
+reproducible. Review changes before choosing a newer production baseline:
+
+- **DEPRECATED / migration:** `loadbalancing` naming is migrating to
+  `load_balancing`; validate the identifier with the target binary rather than
+  copying aliases between versions. [Component source](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/v0.157.0/exporter/loadbalancingexporter).
+- **Released chart behavior:** current chart values include OTLP-based internal
+  telemetry options, distinct from this pull-based metrics baseline. Recheck
+  metrics ports and scrape configuration when changing chart versions.
+  [Current values](https://github.com/open-telemetry/opentelemetry-helm-charts/blob/main/charts/opentelemetry-collector/values.yaml).
+- **PREVIEW / feature gates:** Collector components and feature gates have
+  independent stability. A released binary does not make every component GA.
+  [Feature gate lifecycle](https://github.com/open-telemetry/opentelemetry-collector/blob/main/featuregate/README.md).
+- **Deployment practice:** dedicated trace routing and node-local collection
+  remain conditional tiers; use them when the state/permission owner requires
+  them. [Gateway guidance](https://opentelemetry.io/docs/collector/deploy/gateway/).
 
 ## 📌 Prerequisites
 

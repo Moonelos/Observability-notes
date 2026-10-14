@@ -7,27 +7,56 @@ and topology are intentional.
 
 ---
 
-## 1. 🗺️ What This Baseline Proves
+## 1. Prove delivery before hardening
 
-This deployment proves four things before Kubernetes is involved:
+A container packages a process and its filesystem dependencies. Compose describes
+several such processes and the network names between them. Neither packaging
+method proves telemetry delivery. First establish the same process-level path
+with a local backend you control; then package it.
 
-1. the chosen Collector distribution contains every configured component;
-2. the Collector config parses and starts;
-3. an application can reach both OTLP receivers;
-4. the backend accepts the configured protocol, TLS connection, and credentials.
+The lab below runs an official **Contrib 0.157.0** binary and a small loopback
+HTTP receiver. Obtain the matching release for your OS from the
+[official release](https://github.com/open-telemetry/opentelemetry-collector-releases/releases/tag/v0.157.0).
+It needs Python 3 and free ports 19418, 19433, 19480 and 19488. From the repository root:
 
-It is not highly available. One process, host, disk, and network path remain one
-failure domain.
-
-```text
-application on host or Compose network
-  -> Collector container :4317/:4318
-  -> HTTPS OTLP backend
-
-operator
-  -> health endpoint :13133
-  -> internal Prometheus metrics :8888
+```bash
+python3 examples/local/deployment_canary.py /absolute/path/to/otelcol-contrib
 ```
+
+The [complete lab](../../examples/local/deployment_canary.py) generates a
+minimal traces-only config, validates it with that binary, starts the Collector,
+and posts one named OTLP/JSON span. JSON is an OTLP wire encoding; this stdlib
+producer keeps the first transport proof independent of an SDK installation.
+The backend records the complete decoded request in memory. It is a test
+receiver, with no storage/query guarantee beyond this bounded process run.
+
+Watch where success is established in this sequence:
+
+```mermaid
+sequenceDiagram
+    participant P as deployment-smoke-test
+    participant C as Collector 0.157.0
+    participant B as Controlled local backend
+    P->>C: POST /v1/traces, trace ID ending 02
+    C-->>P: 200 accepted
+    C->>B: Export OTLP request
+    B-->>C: 200 with empty OTLP response
+    Note over B: Assert exact trace ID and service resource
+```
+
+The response to the producer proves ingress; it can precede backend acceptance
+because the exporter queue decouples these actions. The sent counter proves an
+export was acknowledged. The assertion at the backend proves the intended span
+actually crossed the whole path. The lab expects `backend receipt=1`, then
+injects 503 and 401 to show why ingress alone is insufficient. Its final metrics
+show three accepted spans, two sent spans and failed export attempts. A 503 can
+recover on retry; a 401 requires repairing credentials and is permanently
+rejected in this pinned version.
+
+This first lab proves only HTTP traces and the pinned binary. The larger config
+below supports gRPC and all three stable signals; those paths require their own
+producer/backend checks. TLS ingress is exercised in chapter 6. Local receipt
+does not certify a real vendor backend or Kubernetes availability.
 
 ---
 
@@ -150,12 +179,12 @@ Provide credentials without committing them:
 export OTLP_BACKEND_ENDPOINT="https://otlp.example.com"
 export OTLP_BACKEND_AUTHORIZATION="Bearer replace-from-secret-store"
 
-docker compose config
+docker compose config --quiet
 docker compose up -d
 ```
 
-`docker compose config` expands variables and can print secrets. Do not paste
-its output into tickets or CI logs. In a real deployment, inject the values from
+`docker compose config --quiet` validates without printing the expanded model.
+The non-quiet command can disclose credentials; do not use it in shared logs. In a real deployment, inject the values from
 the platform's secret store instead of a checked-in `.env` file.
 
 ---
@@ -253,6 +282,58 @@ window expires.
 
 ---
 
+The persistence lifecycle below explains why restart durability needs the same
+volume, rather than merely the same container name:
+
+```mermaid
+sequenceDiagram
+    participant P as deployment-smoke-test
+    participant C as Collector
+    participant D as collector-data volume
+    participant B as Backend
+    P->>C: Span while backend returns 503
+    C->>D: Persist queued request
+    Note over C: Process restarts
+    D->>C: Recover from the same volume
+    C->>B: Retry after backend recovers
+    B-->>C: Acknowledge receipt
+```
+
+Without disk storage, the restart deletes the queued request. With a deleted or
+unmounted volume, the new process cannot recover it either. Restoring storage
+only restores pending work: receipt still depends on retry policy, valid
+credentials and backend recovery. Run the bounded local persistence variant to exercise this sequence:
+
+```bash
+python3 examples/local/deployment_canary.py /absolute/path/to/otelcol-contrib --persistent
+```
+
+It restarts the Collector while the backend returns 503, reuses the same
+file-storage directory, restores the backend, and asserts receipt of trace 03.
+Counters reset on restart, so backend receipt is the durable cross-process
+proof. This tests process restart with retained storage; it does not test full
+disk, deleted volume, crash corruption or format downgrade.
+
+## Recap, retrieval and try it
+
+Separate process health, accepted input, acknowledged export and backend receipt.
+A single-host deployment remains one host failure domain.
+
+<details><summary>Health is 200 and accepted spans rise; sent spans stay flat. Is delivery proven?</summary>
+No. Ingress works, but export is blocked or rejected. Inspect the queue, export
+failures and endpoint/TLS/auth, then require the canary at the intended backend.
+</details>
+
+<details><summary>Does a persistent queue survive deletion of its volume?</summary>
+No. The bytes belong to the volume, not the logical Collector name. Recovery
+requires the retained volume and a compatible process/configuration.
+</details>
+
+**Try it:** change the 503 interval in the lab to exceed the five-second retry
+window. Predict which span will never receive a backend receipt; inspect the
+Collector log and compare accepted versus sent counts. Do not infer delivery
+from the producer's 200 response.
+
 ## 6. ⚠️ Production Gaps
 
 Before moving this single-host pattern into production, answer:
@@ -272,6 +353,12 @@ For Kubernetes, implement those controls through the chart or Operator rather
 than translating Compose line by line.
 
 ---
+
+<details><summary>Worked solution for try it</summary>
+
+The producer still receives 200, but trace 03 exceeds the retry window and never receives a backend receipt. Accepted input therefore exceeds sent output; a later backend recovery cannot recreate permanently dropped work. Emit a new canary to prove the restored route.
+
+</details>
 
 ## 🔗 Official References
 

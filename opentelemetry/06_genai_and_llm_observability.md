@@ -1,5 +1,7 @@
 # GenAI And LLM Observability
 
+The executable lifecycle lab below was checked with Python 3.14.7 and OTel SDK 1.45.1 on 2026-10-14. Historical convention names in existing tables are retained with an explicit current-development migration boundary in the streaming section; the lab uses custom application metric names.
+
 LLM systems need the same observability foundations as every distributed system:
 latency, errors, saturation, dependency behavior, logs, and trace context. They
 also need extra detail that normal HTTP or database instrumentation does not
@@ -289,8 +291,8 @@ instrumentation.
 
 ## 🛠️ Manual Inference Span Example
 
-The exact provider client differs by SDK. This example uses a
-chat-completions-shaped client to show the OpenTelemetry pattern:
+The exact provider client differs by SDK. This explanatory excerpt uses a
+chat-completions-shaped client to show the OpenTelemetry pattern. It depends on the attribute constants discussed above and a configured client; use the complete fake-provider lab below to execute and verify the lifecycle without credentials:
 
 ```python
 import json
@@ -409,7 +411,7 @@ Notes:
 Streaming has two different latency stories:
 
 - total operation duration: how long until the stream ends;
-- time to first chunk: how long until the user sees the first output.
+- time to first received chunk: transport-visible data may contain only metadata; first text is a separate application timing.
 
 For streaming requests:
 
@@ -421,58 +423,74 @@ For streaming requests:
 | `gen_ai.client.operation.time_per_output_chunk` | Metric for aggregate chunk pacing. |
 | Span duration | Full stream duration. |
 
-Example:
+### A complete physical-attempt lab
+
+Use the Python SDK environment from [02](02_python_instrumentation.md), then run from the repository root:
+
+```bash
+python examples/local/otel_genai_test.py
+```
+
+Success prints `PASS physical attempts, metadata/text clocks, cancellation, failure cleanup, privacy, usage and agent metrics`. This runs a fake provider with real SDK span export and metric aggregation; no provider account or Collector is required. The complete wrapper is [otel_genai.py](../examples/local/otel_genai.py), and [otel_genai_test.py](../examples/local/otel_genai_test.py) owns the reproducible client and assertions. The wrapper accepts a tracer and a meter-backed `Measurements` object so application startup retains sole ownership of the providers. A production adapter must normalize the provider's chunk/usage schema and disable hidden retries; the fake verifies lifecycle and accounting, not provider billing or transport compatibility.
+
+Follow one support-agent attempt. Its clock starts when it issues the request. The first received chunk at 0.1s supplies metadata with no text. The next at 0.4s contains text, and the final chunk at 0.5s supplies usage. The wrapper finalizes at 0.6s.
+
+```mermaid
+sequenceDiagram
+  participant A as support agent
+  participant W as stream_attempt wrapper
+  participant M as fake model
+  participant S as SDK measurements
+  A->>W: begin /chat physical attempt
+  W->>M: create stream once at 0s
+  M-->>W: metadata chunk at 0.1s
+  W->>S: first chunk histogram 0.1s
+  M-->>W: text delta at 0.4s
+  W->>S: first text histogram 0.4s
+  W-->>A: yield text without telemetry buffer
+  alt completed
+    M-->>W: final usage input 10 output 2 at 0.5s
+    W->>M: close stream
+    W->>S: success duration 0.6s and tokens 10 plus 2
+  else caller cancels after text
+    A->>W: close generator
+    W->>M: close stream in finally
+    W->>S: cancelled duration and usage_missing
+  end
+```
+
+The first chunk histogram is 0.1s, while user-visible first text is 0.4s. Neither clock identifies HTTP first byte, and neither counts tokens: a chunk can contain metadata, multiple text fragments, or no text at all. Final provider usage contributes 10 input and 2 output tokens, only once at completion. Span attributes allow an individual investigation; `Counter.add` and `Histogram.record` separately create the aggregates that chapter 05 queries.
+
+The capture-disabled wrapper retains only timestamps, usage, model identity and numeric chunk count. It forwards each text fragment to the caller without concatenating it into a telemetry buffer. The caller and provider still necessarily hold the content they use; the privacy promise is about avoiding an additional instrumentation-owned history. This is not proof that arbitrary provider libraries never buffer internally. Content capture, if added, needs a bounded, explicitly enabled buffer and the masking policy below.
+
+A consumer that stops iterating must close the generator promptly. Garbage collection is not a reliable cleanup protocol. The complete caller pattern is:
 
 ```python
-import time
+from contextlib import closing
 
-from opentelemetry import trace
-from opentelemetry.trace import SpanKind
-
-tracer = trace.get_tracer(__name__)
-
-
-def stream_chat(client, messages: list[dict], *, model: str):
-    with tracer.start_as_current_span(
-        f"chat {model}",
-        kind=SpanKind.CLIENT,
-        attributes={
-            "gen_ai.operation.name": "chat",
-            "gen_ai.provider.name": "openai",
-            "gen_ai.request.model": model,
-            "gen_ai.request.stream": True,
-        },
-        record_exception=False,
-    ) as span:
-        start = time.perf_counter()
-        first_chunk_at: float | None = None
-        chunks: list[str] = []
-
-        try:
-            stream = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True,
-            )
-
-            for chunk in stream:
-                if first_chunk_at is None:
-                    first_chunk_at = time.perf_counter()
-                    span.set_attribute(
-                        "gen_ai.response.time_to_first_chunk",
-                        first_chunk_at - start,
-                    )
-
-                token = extract_text_delta(chunk)
-                if token:
-                    chunks.append(token)
-                    yield token
-        except Exception as exc:
-            span.set_attribute("error.type", type(exc).__name__)
-            raise
-
-        span.set_attribute("app.llm.stream.chunk_count", len(chunks))
+# tracer and measured are application-owned objects from the lab/startup.
+with closing(stream_attempt(client, tracer, measured)) as stream:
+    for text in stream:
+        send_to_user(text)
+        if user_disconnected():
+            break
 ```
+
+This is an explanatory integration excerpt; `send_to_user` and disconnect detection belong to your transport. The executable test uses the same `closing` boundary. On generator close, `GeneratorExit` becomes bounded `app.outcome="cancelled"`, the provider stream closes, one duration is recorded and the span ends. This example treats user cancellation as an outcome rather than a span error; server timeouts or operational cancellation can have a different explicit policy. On provider failure, the wrapper exports `ERROR` and bounded exception class, closes the stream and re-raises. Cleanup failure also records an error and finalizes; it can supersede the original exception, so production should preserve both safely in the approved log boundary. Exception text is never attached to this span.
+
+Do not leave a `start_as_current_span` context active across yielded text: caller code resumes before the generator does and would inherit that span. This wrapper uses `start_span` with the existing parent and ends it explicitly. If provider instrumentation needs the span active, attach it only around provider creation and each iterator advancement, restoring Context before yielding. Alternatively let the provider instrumentation own inference spans and keep this wrapper for aggregate measurement; avoid duplicate receipts for the same attempt.
+
+### Unknown usage and real aggregate recording
+
+Cancellation before the final usage chunk leaves usage **unknown**. The lab records `app.llm.usage_missing += 1`, with no token measurement for that attempt. Recording zero would claim the provider consumed no tokens despite partial generation. Four tested attempts (success, cancellation, failure, retry success) produce four request counts and four duration observations. Successful usage is `(10+2) + (3+1) = 16` tokens; the two incomplete attempts increment missing-usage count. A retry is a new physical request with its own cost and latency, even when it belongs to the same logical agent run.
+
+The application's measurement carrier creates `llm.requests`, `llm.request.duration`, and `llm.tokens`. Every token measurement includes bounded `http.route`, `gen_ai.request.model`, `gen_ai.provider.name`, `app.outcome`, and `gen_ai.token.type`; the route selector in chapter 05 therefore has an actual measurement source. The SDK remains independent of trace sampling. Its counter and histogram aggregates are asserted in the test rather than inferred from span attributes. This uses the collection's custom application names; do not simultaneously record equivalent auto-instrumentation counts into the same SLO.
+
+Agent measurements have a different boundary: the complete `agent_run` context records application-owned `steps` and `tool_calls` at invocation termination. In the fixture one invocation executes two steps and one tool call, producing an `agent.steps` histogram observation of 2 and an `agent.tool.calls` counter increment of 1. Update those values where work actually occurs, including failed steps if your definition includes them. A nested agent owns its own counts; adding its calls again to the parent's direct-call totals double-counts work. The fixture validates the carrier, not an agent framework adapter or cancellation semantics for every framework.
+
+### Current convention boundary
+
+The table above reflects this collection's historical `client.operation.*` convention vocabulary. Current GenAI conventions remain development status and now separate inference metrics into `gen_ai.client.inference.duration`, `.time_to_first_chunk`, and `.time_per_output_chunk`; `gen_ai.client.operation.duration` excludes inference in the [current schema](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/model/gen-ai/metrics.yaml) (checked 2026-10-14). The canonical timings are request issuance through completion, error or cancellation. Do not silently rename a deployed metric: query both old and candidate streams during a bounded canary, compare counts and units, update recording rules/dashboards, then retire the old stream without double-summing them. The custom `llm.*` lab names isolate the accounting lesson from this preview migration.
 
 Do not create a span per token. That explodes trace volume and makes the trace
 harder to read. Record aggregate streaming metrics and, if you need full content,
@@ -752,7 +770,8 @@ def execute_tool(tool_registry, call) -> dict:
         record_exception=False,
     ) as span:
         try:
-            result = tool_registry[tool_name](**call.arguments)
+            tool = tool_registry[tool_name]
+            result = tool(**call.arguments)
         except Exception as exc:
             span.set_attribute("error.type", type(exc).__name__)
             raise
@@ -879,7 +898,7 @@ compliance posture explicitly allow it.
 
 Traces explain one request. Metrics explain the fleet.
 
-The current GenAI semantic conventions define client metrics including:
+The following client and workflow names are a **historical convention reference** for this collection's pinned examples. Current development conventions distinguish inference-specific names; use [the current convention boundary](#current-convention-boundary) above before implementing a new producer or dashboard:
 
 | Metric | Unit | Meaning |
 | --- | --- | --- |
@@ -888,7 +907,7 @@ The current GenAI semantic conventions define client metrics including:
 | `gen_ai.client.operation.time_to_first_chunk` | `s` | Streaming time to first chunk. |
 | `gen_ai.client.operation.time_per_output_chunk` | `s` | Streaming chunk pacing. |
 
-They also define model-server metrics and workflow duration metrics for systems
+The historical reference also includes model-server metrics and workflow duration metrics for systems
 that host models or orchestrate workflows:
 
 | Metric | Unit | Meaning |
@@ -1246,3 +1265,32 @@ For a new LLM service:
 Once those pieces are connected, GenAI observability stops being a separate
 topic. It becomes a domain-specific layer on top of the same OpenTelemetry
 pipeline used by the rest of the system.
+
+
+## Recap and practice
+
+One inference span represents one physical attempt. Metadata-first streams earn a first-chunk observation before they produce user-visible text. Normal completion, provider failure and caller cancellation all own cleanup and exactly one terminal duration. Final usage can be unknown, which must remain visible rather than becoming a zero. Token and agent aggregates require actual metric calls; span attributes alone cannot drive unsampled alerts. Telemetry filtering is distinct from changing what the model receives.
+
+### Check yourself
+
+1. The first chunk contains only the model name. Does it establish first text latency or token usage?
+2. A user disconnects before final usage. Should the wrapper increment tokens by zero?
+3. An agent retries one failed attempt successfully. How many inference attempts and logical agent runs exist?
+
+<details><summary>Reasoned answers</summary>
+
+1. It establishes first-chunk latency only. Wait for a text delta for first-text timing, and authoritative usage for token totals; chunks are not tokens.
+2. No. Close the stream and record cancellation duration plus missing usage. Zero would hide an unknown amount that may still be billed.
+3. Two physical attempts inside one run. Each request has its own span/duration and any known usage; the agent boundary records one termination. Hidden client retries must be exposed or disabled before claiming exact attempt accounting.
+
+</details>
+
+### Try it: change chunk order and cancellation
+
+Change the fake so text arrives before metadata, then close after its first text. Predict the two first-latency observations, chunk count, usage_missing and closed state before running the test. Next return a final usage chunk and consume to completion; predict which metrics differ without changing the text.
+
+<details><summary>Worked solution</summary>
+
+For the first text-containing chunk, first-chunk and first-text clocks are equal. Cancellation after it records chunk count 1, closes the provider, and increments missing usage because no authoritative final totals arrived. Completion still has the same first latencies, but processes the later metadata/usage chunks, records a larger chunk count and success duration, adds known input/output totals and does not increment usage_missing. The text alone cannot tell which accounting result occurred.
+
+</details>

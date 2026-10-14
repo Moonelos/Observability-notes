@@ -1,6 +1,12 @@
 # OpenTelemetry Ingestion and Attribute Mapping
 
-Last verified against official Langfuse and OpenTelemetry documentation on 2026-07-24.
+Routing/filtering checked against official sources on 2026-10-14; mapping baseline checked on 2026-07-24.
+
+Role: implementation. Read [OTel context/export](../opentelemetry/02_python_instrumentation.md)
+and [Langfuse's object model](01_overview_data_model.md) first. The SDK smoke in 02 proves a
+local tree; this chapter adds a destination boundary. Collector configuration examples require
+the pinned Collector distribution and private receiver networking taught in the deployment path.
+Raw experiment blocks below are application-dependent excerpts, not a standalone experiment runner.
 
 ## 🧭 Mental Model
 
@@ -93,7 +99,7 @@ Vendor-neutral does not mean every backend provides the same experience from the
 4. Generation spans use current OpenTelemetry GenAI attributes for operation, provider, model, and usage.
 5. Trace context travels across services with W3C headers.
 6. Selected neutral correlation dimensions travel with baggage and are copied to relevant spans through an explicit allowlist.
-7. The Collector routes complete GenAI workflow traces into the Langfuse pipeline.
+7. The Collector routes complete GenAI workflow traces, or an explicitly classified rooted GenAI view, into the Langfuse pipeline.
 8. Only that pipeline adds any required `langfuse.*` attributes and exports to Langfuse over OTLP/HTTP.
 9. Other pipelines export the original standard and `app.*` attributes to their own backends.
 10. Langfuse maps the enriched spans into observations and makes the workflow available for inspection, scoring, datasets, and metrics.
@@ -141,6 +147,10 @@ Security rules:
 ## 🛠️ Direct Python Exporter: Vendor-Coupled Alternative
 
 The following direct exporter is useful for a small proof of concept, but it is not the recommended implementation when backend independence is a requirement. It places the Langfuse endpoint, authentication, and ingestion behavior in application configuration. In the vendor-neutral design, the application instead uses a normal OTLP exporter pointed at the Collector.
+
+As written, this minimal exporter sends every recorded span on its provider to Langfuse.
+For a mixed application, apply the [destination wrapper](#the-same-filtering-without-a-collector)
+below to this exporter before attaching it to `BatchSpanProcessor`.
 
 ```python
 import os
@@ -365,6 +375,52 @@ Recommended production options:
 
 Langfuse SDK propagation helpers are appropriate for the intentionally vendor-coupled SDK and framework paths described in [06_framework_integrations.md](06_framework_integrations.md). Do not use them in a service whose tracing contract must remain backend-independent.
 
+## See which pipeline owns each copy
+
+The two-ingress topology answers which destinations receive an ordinary workflow and which receive
+a complete GenAI workflow. The GenAI receiver carries roots, retrievals, tools and generations:
+
+```mermaid
+flowchart LR
+  N["ordinary workflows"] --> O["OTLP receiver 4317 / 4318"]
+  G["complete SSO GenAI workflow"] --> R["OTLP genai receiver 4327 / 4328"]
+  subgraph C["trusted Collector"]
+    O --> A["APM pipeline: neutral fields"]
+    R --> A
+    R --> T["Langfuse transform: copy app fields"]
+  end
+  A --> P["APM backend"]
+  T --> L["Langfuse OTLP HTTP + Basic Auth"]
+```
+
+Both streams reach APM; only the complete GenAI stream enters the Langfuse transform.
+The transform creates destination fields without renaming the original `app.*` fields. Therefore
+APM still understands the neutral contract. Filtering to generation leaves before routing would
+remove `rag.answer` and `rag.retrieve`: the model receipt would survive but the evidence needed to
+diagnose the stale SSO source would disappear.
+
+A baggage header is a transport carrier, not stored observation metadata. The downstream service
+must make the handoff explicit before a destination transform can copy it:
+
+```mermaid
+sequenceDiagram
+  participant G as Gateway
+  participant H as HTTP carrier
+  participant R as RAG service
+  participant C as Langfuse pipeline
+  G->>H: inject traceparent + approved tenant tier baggage
+  H->>R: receive enterprise tier
+  R->>R: extract context before creating spans
+  R->>R: allowlist and copy tier to app.trace.dimension.tenant_tier
+  R->>C: root + children with neutral attributes
+  C->>C: copy to langfuse.trace.metadata.tenant_tier
+```
+
+The same traceparent joins the request; copying tier makes it searchable. A header-supplied tier
+cannot authorize an enterprise feature: derive trusted values from application authentication,
+and reject or replace untrusted external baggage. The transform cannot recover a field that was
+never copied onto the needed spans.
+
 ## 📐 Collector-Owned Routing and Vendor Mapping
 
 A common production pattern sends ordinary operational traces to the general tracing backend and sends complete LLM/agent workflow traces to Langfuse. The general backend can also receive the complete GenAI stream when operators need end-to-end service diagnostics there.
@@ -443,9 +499,159 @@ The example maps only an explicit allowlist. Add mappings when a concrete Langfu
 
 GenAI services send all spans for a GenAI workflow to port 4327/4328; ordinary workflows use 4317/4318. Both receiver streams reach the APM backend, while only the complete GenAI stream reaches Langfuse. Protect both receivers on the private network.
 
-If one service mixes GenAI and non-GenAI workflows and cannot choose an ingress endpoint per workflow, route by complete trace rather than by individual span. Propagate a neutral root marker such as `app.telemetry.category="genai"` to all relevant spans, or evaluate it in a trace-aware component after the trace has been assembled. A span-level filter that keeps only spans containing `gen_ai.request.model` will discard roots, HTTP spans, retrievers, tools, and guardrails and break the workflow tree.
+If one service mixes GenAI and non-GenAI workflows and cannot choose an ingress endpoint per workflow, choose complete-trace selection or the explicit rooted view below. A root marker evaluated by a trace-aware component can select a complete trace; a span filter requires the marker on every span it must retain. Baggage alone does not populate span attributes. A filter that keeps only spans containing `gen_ai.request.model` discards parents, retrievers, tools, and guardrails.
 
 > ⚠️ **Watch out:** Filtering by individual span attributes (like model name) instead of by complete trace routes the LLM leaf spans to Langfuse while silently dropping the root, retriever, and tool spans needed to understand them.
+
+### Keep a rooted GenAI view instead of operational subtrees
+
+Filtering Langfuse's destination independently is a useful architecture choice when HTTP,
+database and persistence spans make AI workflows noisy. The `otel-observability` skill's
+`references/collector/genai_projection.md` applies this policy. It is a project contract,
+not a universal OTel requirement that Langfuse receive only attributes named `gen_ai.*`.
+
+For one mixed `/chat` request, the APM backend gets the complete tree. The Langfuse view
+keeps the root, the business operation explaining the model call, and the model:
+
+```mermaid
+flowchart LR
+    S["one /chat trace: 5 spans"] --> A["APM: all 5 spans"]
+    S --> F["GenAI destination filter"]
+    F --> L["Langfuse: POST /chat → answer question → chat demo-model"]
+    F --> D["omit load documents and persist answer siblings"]
+```
+
+Every retained span must retain its entire parent chain to the root: this is an
+**ancestor-closed** view. All IDs, parent IDs, timestamps and status stay unchanged.
+The root and `answer question` keep their true semantics; do not invent
+`gen_ai.operation.name` on them just to pass a filter. A log referencing an omitted
+DB span still uses its actual span ID and remains correlatable in APM.
+
+Use `app.telemetry.category="genai"` as explicit membership in this view: set it on
+the root, workflow/agent/model/retrieval/tool spans and every intermediate parent.
+Ordinary `/health` traces and operational-only sibling subtrees remain unmarked.
+Do not inherit membership indiscriminately onto every child, or the DB/HTTP noise returns.
+For synchronous multi-service traces, each service must classify the required ancestors;
+if it cannot, send the complete workflow trace instead. A Collector filter cannot
+reconstruct a missing parent or infer ancestry from the model span's attributes.
+
+Add this processor to the Collector's Langfuse branch only. This is an excerpt for
+Collector Contrib **0.159.0**, using its current condition syntax; validate against
+the exact deployed image before merging it into an older config:
+
+```yaml
+processors:
+  filter/genai_projection:
+    error_mode: ignore
+    trace_conditions:
+      - 'span.attributes["app.telemetry.category"] != "genai"'
+
+service:
+  pipelines:
+    traces/langfuse:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/genai_projection, transform/langfuse, batch]
+      exporters: [otlphttp/langfuse]
+```
+
+Conditions mean **drop**, so missing markers are removed too. Leave the APM branch
+unfiltered and redact its verbose AI payloads separately. For tail sampling, evaluate
+the retention policy on the complete trace before applying the destination projection;
+otherwise an operational error you removed can no longer influence that decision.
+`error_mode: ignore` skips a failing condition and can allow spans through; this filter
+is destination selection, not a substitute for mandatory secret redaction.
+The [pinned filter documentation](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.159.0/processor/filterprocessor/README.md)
+defines the syntax and warns about orphaned telemetry.
+
+### The same filtering without a Collector
+
+Use one `TracerProvider` with independent destination processors. The APM processor
+receives all recorded spans; the Langfuse processor receives the marked view. Never use
+the provider's sampler to suppress non-GenAI spans just for Langfuse: head sampling
+affects every destination and only sees attributes available when the span starts.
+
+With the Langfuse Python SDK, configure the filter at initialization:
+
+```python
+from langfuse import Langfuse
+from genai_destination_filter import keep_genai_view  # examples/local module
+
+# provider already owns the ordinary APM BatchSpanProcessor.
+langfuse = Langfuse(
+    tracer_provider=provider,
+    should_export_span=keep_genai_view,
+)
+```
+
+This callback replaces the SDK default. The SDK's current default accepts Langfuse,
+GenAI and recognized LLM instrumentation spans; it reduces infrastructure noise but
+does not prove that ordinary application parents survive. For a deliberate rooted
+view, explicitly mark every selected ancestor and use the membership callback.
+Compose with `is_default_export_span` only if you also intend to accept its broader
+set. See [Langfuse filtering](https://langfuse.com/docs/observability/sdk/advanced-features).
+
+With **raw OTel and no Langfuse SDK**, the plain OTLP exporter has no Langfuse
+`should_export_span` option. Wrap only the Langfuse destination's exporter:
+
+```python
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from genai_destination_filter import GenAIViewExporter
+
+# langfuse_otlp is the authenticated OTLP/HTTP exporter configured above.
+provider.add_span_processor(
+    BatchSpanProcessor(GenAIViewExporter(langfuse_otlp))
+)
+```
+
+The wrapper delegates export, flush and shutdown, filters ended `ReadableSpan`s and
+never mutates spans shared with other processors. This version filters after batching:
+unselected spans still consume the branch's queue capacity. A custom filtering processor
+before batching can avoid that overhead, but must preserve the SDK processor lifecycle.
+Direct export also moves credentials, retry/queue budgets, mapping and redaction into
+the application deployment. Keep those policies explicit; the example verifies routing
+and contains no real payloads. The unfiltered APM branch in this local canary is not a
+production payload-redaction implementation.
+
+Run the complete local canary in the SDK environment from chapter 02:
+
+```bash
+/tmp/langfuse-notes-venv/bin/python examples/local/genai_destination_filter.py
+```
+
+The [canonical script](../examples/local/genai_destination_filter.py) runs both raw-OTel
+and real Langfuse SDK filtering with in-memory destinations. Each produces `APM=6,
+GenAI=3`: five `/chat` spans plus an unrelated `/health` root go to APM, while only
+the three connected AI-view spans go to the GenAI destination. Assertions check IDs,
+parents, timestamps, absence of orphaned children, and a named correlated log event.
+This proves local SDK export behavior, not Collector execution or backend indexing.
+
+The [Collector canary](../examples/local/verify_genai_projection.py) separately validates
+the same condition against Contrib 0.159.0, sends real OTLP to a loopback receiver,
+and checks both exported span sets using local files:
+
+```bash
+/tmp/langfuse-notes-venv/bin/python examples/local/verify_genai_projection.py /path/to/otelcol-contrib
+```
+
+Expected: `PASS Collector 0.159.0: APM=6, GenAI=3; full parent chain and original span fields preserved`.
+It requires that exact binary and the OTLP/HTTP trace exporter installed in chapter 02.
+It tests the filtering mechanism; production redaction, sampling, network security and
+Langfuse indexing still need the deployed canary.
+
+Before rollout, send a mixed canary through the deployed path and verify both backends:
+complete APM tree, same trace ID in Langfuse, one retained root, every retained parent
+present, and operational siblings absent. Track exporter failures/drops and queue
+pressure independently for each destination. Restore complete-workflow export if
+classification is incomplete rather than silently reparenting observations.
+
+<details>
+<summary>Check yourself: a new HTTP span is inserted between answer question and the model. Can it remain unmarked?</summary>
+
+No. It becomes an ancestor of a retained model span, so omitting it breaks the parent
+chain. Mark that HTTP span too, or preserve the complete workflow. An unrelated HTTP
+sibling can remain unmarked. Retention depends on ancestry, not the library name.
+
+</details>
 
 Architecture responsibilities:
 
@@ -708,3 +914,40 @@ The real OTLP encoding may be protobuf or JSON. Before the transform, the same s
 - OpenTelemetry Collector transform processor: <https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/transformprocessor>
 - OpenTelemetry GenAI semantic conventions: <https://github.com/open-telemetry/semantic-conventions-genai>
 - OpenTelemetry GenAI spans, pinned revision: <https://github.com/open-telemetry/semantic-conventions-genai/blob/46d43c8949afb53765a202e89f4534eeb75ca3fa/docs/gen-ai/gen-ai-spans.md>
+
+## Retain the mapping reasoning
+
+- Neutral application attributes describe work; only the destination pipeline adds Langfuse fields.
+- Preserve the whole SSO workflow so a generation remains connected to source evidence.
+- Inject/extract context joins services; allowlisted baggage-to-span copying makes dimensions visible.
+- Prove acceptance, export and backend lookup separately; a valid YAML file proves syntax only.
+
+**Q: Tier is visible in catch-all metadata but dashboard filters cannot use it. Must the app emit vendor names?**
+
+<details><summary>Answer</summary>
+
+No. Keep the neutral source, ensure it appears on the relevant spans, then copy it into the
+allowlisted `langfuse.trace.metadata.tenant_tier` destination field. APM keeps its original fields.
+
+</details>
+
+**Q: A generation survives a filter, but its parent does not. Has the complete SSO trace been retained?**
+
+<details><summary>Answer</summary>
+
+No. Shared trace ID still correlates surviving records, but missing root/retriever evidence prevents
+explaining the product task and stale source. Route the whole workflow through the GenAI ingress.
+
+</details>
+
+**Try it:** Add bounded plan values `free` and `enterprise` to the neutral schema. Predict the
+field sets at both destinations before changing the transform.
+
+<details><summary>Worked solution</summary>
+
+Emit `app.trace.dimension.plan` on needed spans after validating the value. In the Langfuse-only
+transform, copy it to `langfuse.trace.metadata.plan` when present. APM receives only the neutral
+plan; Langfuse receives neutral and copied fields. Verify both destinations with a synthetic trace;
+production backend validation requires credentials and is separate from this prediction.
+
+</details>

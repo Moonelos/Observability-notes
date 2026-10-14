@@ -1,0 +1,396 @@
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  file_storage:
+    directory: /var/lib/otelcol/storage
+    create_directory: true
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 1024
+    spike_limit_mib: 256
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+  resource:
+    attributes:
+    - key: deployment.environment.name
+      value: prod
+      action: upsert
+  attributes/redact_common:
+    actions:
+    - key: http.request.header.authorization
+      action: delete
+    - key: http.request.header.cookie
+      action: delete
+    - key: http.response.header.set_cookie
+      action: delete
+    - key: db.query.text
+      action: delete
+    - key: db.statement
+      action: delete
+    - key: exception.message
+      action: delete
+    - key: exception.stacktrace
+      action: delete
+    - key: user.email
+      action: delete
+  attributes/redact_payloads:
+    actions:
+    - key: gen_ai.system_instructions
+      action: delete
+    - key: gen_ai.input.messages
+      action: delete
+    - key: gen_ai.output.messages
+      action: delete
+    - key: gen_ai.tool.definitions
+      action: delete
+    - key: gen_ai.tool.call.arguments
+      action: delete
+    - key: gen_ai.tool.call.result
+      action: delete
+    - key: langfuse.observation.input
+      action: delete
+    - key: langfuse.observation.output
+      action: delete
+    - key: langfuse.trace.input
+      action: delete
+    - key: langfuse.trace.output
+      action: delete
+    - key: llm.prompts
+      action: delete
+    - key: llm.completions
+      action: delete
+  transform/redact_logs:
+    error_mode: propagate
+    log_statements:
+    - context: log
+      statements:
+      - delete_key(attributes, "gen_ai.system_instructions")
+      - delete_key(attributes, "gen_ai.input.messages")
+      - delete_key(attributes, "gen_ai.output.messages")
+      - delete_key(attributes, "gen_ai.tool.definitions")
+      - delete_key(attributes, "gen_ai.tool.call.arguments")
+      - delete_key(attributes, "gen_ai.tool.call.result")
+      - delete_key(attributes, "langfuse.observation.input")
+      - delete_key(attributes, "langfuse.observation.output")
+      - delete_key(attributes, "langfuse.trace.input")
+      - delete_key(attributes, "langfuse.trace.output")
+      - delete_key(attributes, "llm.prompts")
+      - delete_key(attributes, "llm.completions")
+      - set(body, "[REDACTED_BY_DEFAULT]") where body != nil
+  tail_sampling/langfuse:
+    decision_wait: 30s
+    num_traces: 50000
+    expected_new_traces_per_sec: 500
+    decision_cache:
+      sampled_cache_size: 100000
+      non_sampled_cache_size: 100000
+    policies:
+    - name: drop-explicit-no-sample
+      type: drop
+      drop:
+        drop_sub_policy:
+        - name: do-not-sample
+          type: boolean_attribute
+          boolean_attribute:
+            key: app.do_not_sample
+            value: true
+    - name: keep-llm-errors
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: has-error-status
+          type: status_code
+          status_code:
+            status_codes:
+            - ERROR
+    - name: keep-provider-error-types
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: provider-error-type
+          type: string_attribute
+          string_attribute:
+            key: error.type
+            values:
+            - RateLimitError
+            - TimeoutError
+            - APIConnectionError
+    - name: keep-slow-llm-traces
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: trace-latency-over-15s
+          type: latency
+          latency:
+            threshold_ms: 15000
+    - name: keep-large-agent-traces
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: many-spans
+          type: span_count
+          span_count:
+            min_spans: 40
+    - name: keep-high-input-token-traces
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: high-input-tokens
+          type: numeric_attribute
+          numeric_attribute:
+            key: gen_ai.usage.input_tokens
+            min_value: 8000
+    - name: keep-high-output-token-traces
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: high-output-tokens
+          type: numeric_attribute
+          numeric_attribute:
+            key: gen_ai.usage.output_tokens
+            min_value: 4096
+    - name: keep-high-cost-traces
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: high-estimated-cost
+          type: numeric_attribute
+          numeric_attribute:
+            key: app.llm.cost_microusd
+            min_value: 500000
+    - name: keep-guardrail-blocks
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: guardrail-blocked
+          type: boolean_attribute
+          boolean_attribute:
+            key: app.guardrail.blocked
+            value: true
+    - name: keep-selected-models
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: model-under-review
+          type: string_attribute
+          string_attribute:
+            key: gen_ai.request.model
+            values:
+            - gpt-4.1
+            - claude-3-5-sonnet
+    - name: keep-selected-experiments
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: experiment-under-review
+          type: string_attribute
+          string_attribute:
+            key: app.experiment.name
+            values:
+            - rag-reranker-v2
+            - prompt-v17
+    - name: keep-selected-tenant-tiers
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: high-value-tenant-tier
+          type: string_attribute
+          string_attribute:
+            key: app.tenant.tier
+            values:
+            - enterprise
+            - internal
+    - name: keep-new-release-burn-in
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: release-under-observation
+          type: string_attribute
+          string_attribute:
+            key: service.version
+            values:
+            - 2026.07.20-1
+    - name: sample-normal-llm-workflows
+      type: and
+      and:
+        and_sub_policy:
+        - name: is-llm-workflow
+          type: boolean_attribute
+          boolean_attribute:
+            key: llm.workflow
+            value: true
+        - name: sample-five-percent
+          type: probabilistic
+          probabilistic:
+            sampling_percentage: 5
+exporters:
+  otlp/main_traces:
+    endpoint: traces.example.com:4317
+    tls:
+      insecure: false
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 10m
+  otlphttp/langfuse:
+    endpoint: ${env:LANGFUSE_OTEL_ENDPOINT}
+    headers:
+      Authorization: Basic ${env:LANGFUSE_AUTH_STRING}
+      x-langfuse-ingestion-version: '4'
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 10m
+  prometheus_remote_write:
+    endpoint: https://prometheus.example.com/api/v1/write
+    translation_strategy: UnderscoreEscapingWithoutSuffixes
+    resource_to_telemetry_conversion:
+      enabled: true
+    remote_write_queue:
+      enabled: true
+      queue_size: 10000
+      num_consumers: 5
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 10m
+  otlp/logs:
+    endpoint: logs.example.com:4317
+    tls:
+      insecure: false
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 10m
+service:
+  extensions:
+  - health_check
+  - file_storage
+  pipelines:
+    traces/main:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - resource
+      - attributes/redact_common
+      - attributes/redact_payloads
+      - batch
+      exporters:
+      - otlp/main_traces
+    traces/langfuse:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - resource
+      - attributes/redact_common
+      - tail_sampling/langfuse
+      - batch
+      exporters:
+      - otlphttp/langfuse
+    metrics:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - resource
+      - batch
+      exporters:
+      - prometheus_remote_write
+    logs:
+      receivers:
+      - otlp
+      processors:
+      - memory_limiter
+      - resource
+      - attributes/redact_common
+      - transform/redact_logs
+      - batch
+      exporters:
+      - otlp/logs

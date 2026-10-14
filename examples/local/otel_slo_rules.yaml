@@ -1,0 +1,92 @@
+groups:
+- name: chat-api-slo-recording
+  interval: 1m
+  rules:
+  - record: chat_api:slo_error_ratio:rate5m
+    expr: 'sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}[5m]))
+
+      /
+
+      clamp_min(sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[5m])),
+      1e-12)
+
+      '
+  - record: chat_api:slo_error_ratio:rate30m
+    expr: 'sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}[30m]))
+
+      /
+
+      clamp_min(sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[30m])),
+      1e-12)
+
+      '
+  - record: chat_api:slo_error_ratio:rate1h
+    expr: 'sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}[1h]))
+
+      /
+
+      clamp_min(sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[1h])),
+      1e-12)
+
+      '
+  - record: chat_api:slo_error_ratio:rate6h
+    expr: 'sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}[6h]))
+
+      /
+
+      clamp_min(sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[6h])),
+      1e-12)
+
+      '
+- name: chat-api-slo-alerts
+  rules:
+  - alert: ChatApiSloFastBurn
+    expr: '(chat_api:slo_error_ratio:rate5m / 0.005 > 14.4)
+
+      and
+
+      (chat_api:slo_error_ratio:rate1h / 0.005 > 14.4)
+
+      and
+
+      sum(increase(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[5m]))
+      >= 100
+
+      and
+
+      sum(increase(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[1h]))
+      >= 1000
+
+      '
+    for: 2m
+    labels:
+      severity: page
+      service: chat-api
+    annotations:
+      summary: chat-api is rapidly consuming its 30-day error budget
+      runbook: Check bad-event mix, release, dependencies, and representative traces.
+  - alert: ChatApiSloSlowBurn
+    expr: '(chat_api:slo_error_ratio:rate30m / 0.005 > 6)
+
+      and
+
+      (chat_api:slo_error_ratio:rate6h / 0.005 > 6)
+
+      and
+
+      sum(increase(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[30m]))
+      >= 500
+
+      and
+
+      sum(increase(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[6h]))
+      >= 5000
+
+      '
+    for: 15m
+    labels:
+      severity: ticket
+      service: chat-api
+    annotations:
+      summary: chat-api has sustained error-budget burn
+      runbook: Compare six-hour bad events with baseline and open affected traces.

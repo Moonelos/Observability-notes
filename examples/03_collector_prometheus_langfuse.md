@@ -1,6 +1,6 @@
 # Example: Collector, Prometheus, Langfuse, and Alerts
 
-Last checked against the Langfuse and OpenTelemetry documentation on 2026-07-20.
+Collector schema and local sampling/privacy tests checked on 2026-10-14 against Contrib 0.158.0. External Langfuse destinations and durable recovery require the production gates below.
 
 This example uses the OpenTelemetry Collector as a production routing layer:
 
@@ -10,6 +10,25 @@ This example uses the OpenTelemetry Collector as a production routing layer:
 - logs go to a log backend;
 - alert rules run from metrics, while Langfuse is used for investigation and quality workflows.
 
+The diagram follows one SSO request into four independently owned outputs. Look at the extra content deletion on APM and the sampling decision only on Langfuse.
+
+```mermaid
+flowchart LR
+  R[OTLP receiver: traces metrics and logs] --> A[APM: memory limit resource and redact_common]
+  A --> AP[redact_payloads then batch]
+  AP --> AT[otlp/main_traces]
+  R --> L[Langfuse: memory limit resource and redact_common]
+  L --> TS[tail_sampling/langfuse then batch]
+  TS --> LF[otlphttp/langfuse: approved masked content]
+  R --> M[Metrics: memory limit resource and batch]
+  M --> MW[prometheus_remote_write]
+  R --> G[Logs: memory limit resource and redact_common]
+  G --> GP[redact_logs: content keys and body suppression]
+  GP --> GL[batch then otlp/logs]
+```
+
+The main trace destination receives operational shape without content; the Langfuse destination may retain approved masked content after its trace decision. Metrics do not inherit trace sampling, and logs do not wait for the tail decision. Therefore a log can retain a valid trace ID for a trace absent from Langfuse, while the same trace still exists in the unsampled main backend. Universal secrets must be removed on each relevant branch, not just the one that happened to be inspected during a smoke test.
+
 ## 🔀 Collector Configuration
 
 ```yaml
@@ -18,6 +37,7 @@ extensions:
     endpoint: 0.0.0.0:13133
   file_storage:
     directory: /var/lib/otelcol/storage
+    create_directory: true
 
 receivers:
   otlp:
@@ -212,8 +232,8 @@ processors:
             - name: high-estimated-cost
               type: numeric_attribute
               numeric_attribute:
-                key: app.llm.cost_usd
-                min_value: 0.50
+                key: app.llm.cost_microusd
+                min_value: 500000
       - name: keep-guardrail-blocks
         type: and
         and:
@@ -329,8 +349,7 @@ exporters:
       max_elapsed_time: 10m
 
   prometheus_remote_write:
-    http:
-      endpoint: https://prometheus.example.com/api/v1/write
+    endpoint: https://prometheus.example.com/api/v1/write
     translation_strategy: UnderscoreEscapingWithoutSuffixes
     resource_to_telemetry_conversion:
       enabled: true
@@ -471,7 +490,7 @@ Langfuse observations useful instead of sending only a workflow marker:
 import json
 
 from opentelemetry import trace
-from privacy import mask
+from privacy import safe_text as mask
 
 tracer = trace.get_tracer(__name__)
 
@@ -804,9 +823,53 @@ Then alert on sustained drops:
           summary: "RAG answer relevance dropped below threshold"
 ```
 
+## Follow a tail decision through arrival, expiry and export
+
+For trace `abc123`, every service must reach the same sampler through the trace-ID-aware routing tier taught in [production architecture](../opentelemetry/03_production_architecture.md). This timeline shows the configured 30-second window; it is a worked sequence, not a measured capacity recommendation.
+
+```mermaid
+sequenceDiagram
+  participant A as chat-api and retrieval
+  participant S as one tail sampler for abc123
+  participant Q as exporter queue
+  participant L as Langfuse
+  A->>S: t=0 first spans for abc123
+  S->>S: buffer undecided trace, start 30s wait
+  A->>S: t=2s retrieval ERROR and root completion
+  S->>S: t=30s evaluate completed evidence
+  alt keep policy matches
+    S->>Q: enqueue retained trace abc123
+    Q->>L: export with retry within configured bound
+  else no keep policy matches
+    S->>S: reject trace, remember non-sampled decision
+  end
+  A->>S: later span for abc123
+  S->>S: use cached decision while retained
+```
+
+The failure attribute can influence the decision only if it arrives before the window closes. Late spans use decision-cache state where available; cache expiry, capacity eviction, or a restart can remove that state, so late arrivals must be measured and tested. Exporter persistent queues begin after the sampling decision: they can preserve already retained spans through restart, but the sampler's undecided buffer remains memory state. A restart at t=15s therefore loses evidence the persistent queue never received. Increase the wait only from measured complete-trace arrival time and capacity; a longer window multiplies active memory and still cannot recover a head-dropped trace. The isolated local suite below accelerates this window solely for tests, without asserting production arrival guarantees.
+
+## Run the local policy and privacy suite
+
+Install the Python SDK/OTLP packages described in [Python instrumentation](../opentelemetry/02_python_instrumentation.md), plus `PyYAML`. Supply an executable Contrib 0.158.0 binary; the script checks its version before starting private loopback listeners. Run from the repository root:
+
+```bash
+python -m pip install PyYAML opentelemetry-exporter-otlp-proto-http
+python examples/local/otel_collector_test.py /path/to/otelcol-contrib
+python examples/local/otel_collector_signal_test.py /path/to/otelcol-contrib
+```
+
+The first command's script reads [otel_collector_routing.yaml](local/otel_collector_routing.yaml), extracted from the complete deployment template above. Each of twelve named `keep-*` policies runs in isolation, with the probabilistic fallback absent. It emits a matching trace, a just-below/nonmatching trace, a boolean-false workflow gate, and the string `"true"` gate through the real Python SDK and OTLP exporter. Only the matching trace may survive. This verifies actual boolean type semantics instead of relying on YAML alone. A separate trace matching both explicit drop and error keep must be dropped. Success prints twelve isolated-policy PASS lines, then `PASS drop overrides matching error keep` and the suite PASS. Local processes terminate and temporary output files are removed even on failure.
+
+The suite revealed why schema validation alone is insufficient: pinned `numeric_attribute.min_value` is an integer field. A dollar threshold `0.50` could become zero and leave the runtime evaluator invalid. This template instead uses `app.llm.cost_microusd=500000` with an integer threshold of 500000, representing $0.50. Emit the estimate using a reviewed decimal calculation, for example `int(Decimal("0.50") * 1_000_000)`, never a currency-formatted string. Keep the human-facing `app.llm.cost_usd` value if useful, but the sampling policy reads the explicit integer carrier. The positive/negative fixtures at 500000/499999 prove the boundary. See the [pinned policy schema](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.158.0/processor/tailsamplingprocessor/config.go) (checked 2026-10-14).
+
+The second script verifies a separate boundary with local file destinations replacing APM and Langfuse. A span's approved masked payload survives only on the richer branch; synthetic secret attributes disappear on both. A real SDK named log retains its event name, trace/span correlation and boolean field while its secret attributes and body are suppressed. The script also records SDK `llm.tokens` with `http.route=/chat`, exports to the Collector, and confirms a scraped `llm_tokens_total` series has `http_route`, token-type, service and environment labels. Success ends with `PASS named-log body/attribute privacy, SDK bool type, trace correlation, destination split and actual exported metric labels`. The scrape proves metric label composition, not remote-write transport to an authenticated backend.
+
+These tests are safe local checks. Real backend ingestion, Langfuse content/access controls, durable queue restart recovery, tail-state loss during restart, load capacity, trace-ID router membership changes, and all alert-rule variants remain staging gates. Run those with production-like approved data and record the recovery/loss budget before calling the deployment production-ready.
+
 ## ✅ Executable Policy and Rule Tests
 
-Validate sampling with a Collector test config that replaces the Langfuse exporter with `debug` and changes only `sample-five-percent` to 100 percent. The following generator emits one trace for every policy plus an unmatched trace. It uses explicit timestamps, so the latency case does not sleep for 16 seconds.
+The broad smoke fixture below can confirm delivery, but its 100-percent normal fallback cannot prove each named keep policy: that fallback would also retain a trace whose critical policy failed. Use the isolated executable suite first; it disables the fallback and runs each named policy alone with positive and negative fixtures. A separate test covers explicit-drop precedence. For an optional delivery smoke test, replace the Langfuse exporter with `debug` and change only `sample-five-percent` to 100 percent. The following generator emits one trace for every policy plus an unmatched trace. It uses explicit timestamps, so the latency case does not sleep for 16 seconds.
 
 ```python
 # emit_sampling_cases.py
@@ -847,7 +910,7 @@ cases = [
     ("keep-large-agent-traces", base, {"child_count": 39}),  # root + 39 = 40
     ("keep-high-input-token-traces", base | {"gen_ai.usage.input_tokens": 8000}, {}),
     ("keep-high-output-token-traces", base | {"gen_ai.usage.output_tokens": 4096}, {}),
-    ("keep-high-cost-traces", base | {"app.llm.cost_usd": 0.50}, {}),
+    ("keep-high-cost-traces", base | {"app.llm.cost_microusd": 500000}, {}),
     ("keep-guardrail-blocks", base | {"app.guardrail.blocked": True}, {}),
     ("keep-selected-models", base | {"gen_ai.request.model": "gpt-4.1"}, {}),
     ("keep-selected-experiments", base | {"app.experiment.name": "rag-reranker-v2"}, {}),
@@ -933,3 +996,32 @@ When an alert fires:
 - Avoid routing duplicate traces to Langfuse from both SDK and Collector.
 - Keep metric labels low-cardinality.
 - Validate dashboards and alerts in staging before paging production teams.
+
+
+## Recap and practice
+
+Separate destination pipelines own separate content and retention policies. The SDK emits boolean workflow gates, the sampling tier decides after trace assembly, and log export proceeds independently. Deterministic tests must remove a normal-traffic fallback or it can conceal a broken critical policy. Schema validation is necessary but runtime fixtures reveal conversion and evaluator defects.
+
+### Check yourself
+
+1. Every critical trace appears when the fallback is 100%. Has each critical policy passed?
+2. Why does a trace carrying `llm.workflow="true"` fail the boolean workflow gate?
+3. Does a local Prometheus scrape prove an authenticated remote-write destination received the samples?
+
+<details><summary>Reasoned answers</summary>
+
+1. No. The fallback alone can retain them. Isolate named policies and include negative cases before testing the assembled policy interactions.
+2. It is a string, while the policy requires a typed boolean. The SDK preserves this distinction in OTLP; do not use string truthiness as instrumentation semantics.
+3. No. It proves local aggregation/mapping/exposure. Remote transport, authentication, tenant routing and backend queryability need a separate integration gate.
+
+</details>
+
+### Try it: a privacy policy changes
+
+Your log backend may now retain an allowlisted operational body instead of suppressing every body. Design the smallest safe change and canary test. Predict whether a secret inside a nested string is removed by deleting `exception.message`.
+
+<details><summary>Worked solution</summary>
+
+Define and implement a structured allowlist/masker before export, preserving only approved fields. Keep the conservative Collector body replacement until that test passes. Test named event attributes, body strings, nested JSON and exception paths on every destination with synthetic markers. Deleting a key named `exception.message` removes that field only; it cannot discover the same string hidden under a different allowed key. Validate syntax and execute the signal test, then test the proposed masking function with changed nesting before a canary deployment.
+
+</details>

@@ -1,66 +1,67 @@
 # Langfuse Overview and Data Model
 
-Last verified against official Langfuse documentation on 2026-07-24.
+Pinned baseline retained; audit remediation and version-sensitive research checked 2026-10-14.
 
-## 🧭 Mental Model
+## Follow one stale SSO answer before naming the objects
 
-Langfuse starts from OpenTelemetry's trace model and turns it into an AI engineering record. OpenTelemetry can tell you that a request spent 820 ms in an outbound HTTP call. Langfuse can tell you that the call was a generation using a specific model and prompt version, consumed a certain number of tokens, produced a specific answer, received negative user feedback, and regressed after a release.
+Role: foundation. You need basic Python and shell use and the trace/span/context model in
+[OpenTelemetry concepts](../opentelemetry/01_concepts.md). The specialist AI terms are introduced here.
+The teaching baseline is Python SDK **4.17.0** with the observation-first server-v4 model;
+SDK and server major versions are separate. Python SDK v5 is now GA; the migration boundary is in
+[the section index](README.md#whats-changing). Sources checked 2026-10-14.
 
-Think of Langfuse as three connected layers:
+A user asks “How do I reset SSO?” Our support application searches a document collection, gives
+one matching document to a model, and returns “Open Settings > Security.” This is **retrieval
+augmented generation (RAG)**: application-selected evidence is included in the model request.
+The answer is wrong after the UI moved to Account > Identity. An HTTP trace reports a successful
+820-ms model call. That tells us the provider responded, but cannot establish that the instruction
+was current. We need evidence about the retrieved revision, prompt version, and resulting answer.
 
-```text
-execution layer     trace -> observations -> generation/retriever/tool/guardrail details
-evaluation layer    feedback -> scores -> annotations -> datasets -> experiments
-analytics layer     dashboards/API -> cost, latency, volume, quality, release comparisons
+Use one trace for this request. A trace is the shared correlation identity; observations are the
+individual timed steps, built from OTel spans. The root observation records the user's task and
+final answer. A retriever child records what search supplied. A generation child records one
+model invocation, its approved request/response, and usage. Parent IDs express containment;
+matching names alone do not. Here are illustrative IDs, shortened for readability:
+
+| Observation | ID | Parent | Evidence |
+| --- | --- | --- | --- |
+| `rag.answer` | `a001` | none | question → final answer, release `sso-a1` |
+| `rag.retrieve` | `b002` | `a001` | `doc_001`, revision `r3`, score `0.82` |
+| `llm.generate_answer` | `c003` | `a001` | prompt-v17, 820 input / 164 output tokens |
+
+All three have trace ID `9d1b…`. The diagram separates the execution tree from records added later:
+
+```mermaid
+flowchart TD
+  T["trace 9d1b…: one SSO request"] --> R["a001 rag.answer: question → stale answer"]
+  R --> D["b002 rag.retrieve: doc_001 r3"]
+  R --> G["c003 generation: prompt-v17, 820 / 164 tokens"]
+  T -. "later target by trace ID" .-> S["score answer_correct_v1 = 0"]
+  S -. "curate reviewed task" .-> I["dataset item sso-reset: expected Account / Identity"]
+  I --> E["candidate experiment: doc r4 + prompt-v18"]
 ```
 
-The data model solves the question "What happened, why, and was it good?" It does not by itself solve authorization, redaction, incident paging, or business-specific evaluation logic. Those come from your application, governance controls, metric/log stack, and evaluator code.
+The solid root-to-child edges describe work during the original request. The later score is a
+judgment, not a timed child that keeps that request open. The dataset item copies an approved
+problem and expected result so we can replay the task. An experiment executes that task again
+under a candidate configuration; it creates new execution evidence rather than editing `c003`.
 
-The most important design choice is where information belongs:
+Suppose a thumbs-down arrives five minutes later. The application must retain the original trace
+ID with the displayed answer, then the feedback service targets that ID. Starting a new trace
+for the feedback endpoint is useful for its own latency, but putting the score on that new trace
+would judge the feedback handler rather than the answer. A score on `c003` would instead judge
+that particular model call; choose trace-level correctness for the complete SSO workflow.
 
-- Put workflow identity on the trace.
-- Put step-specific evidence on observations.
-- Put model-call details on generations.
-- Put quality judgments on scores.
-- Put reproducible examples in datasets.
-- Put operational health in metrics and logs outside Langfuse when it is not LLM-specific.
+The first diagnosis follows the evidence: search supplied r3; the model repeated r3 faithfully;
+therefore changing temperature is unlikely to repair stale instructions. Replace/re-index r3 with
+reviewed r4, turn this failure into a regression item, and compare the same task before promotion.
+A citation pointing to `doc_001` proves presence of that ID, not that r3 was correct or current.
+[Evaluation](05_evaluation_metrics_alerting.md) develops that distinction into a release gate.
 
-## 📌 What Langfuse Is
-
-Langfuse is a production platform for AI engineering:
-
-- Observability for LLM calls, RAG pipelines, tools, agents, chains, retrievers, guardrails, and evaluators.
-- Prompt management and prompt version tracking.
-- Scores from users, humans, code evaluators, and LLM-as-judge systems.
-- Datasets and experiments for offline evaluation.
-- Metrics and dashboards for quality, cost, latency, and volume.
-- Public API and data access for internal analytics and workflows.
-
-Langfuse is built on OpenTelemetry. A Langfuse observation is an OpenTelemetry span with Langfuse-specific attributes and types.
-
-## 🔄 Lifecycle: From Request to Improvement
-
-1. A user message, background job, or agent task starts.
-2. The application creates a root trace/observation such as `rag.answer`.
-3. Child observations describe the workflow: `query.rewrite`, `rag.retrieve`, `llm.generate_answer`, `guardrail.output_policy`, `response.persist`.
-4. Generations record model, parameters, safe input/output, usage, and cost details.
-5. Trace attributes such as user, session, release, version, tags, and metadata let you slice the data later.
-6. After the response, feedback, code checks, human review, or LLM judges create scores.
-7. Useful failures become dataset items.
-8. Experiments run candidate prompts, models, retrieval settings, or agent logic against datasets.
-9. Langfuse metrics and dashboards show whether production quality, latency, volume, and cost improved after rollout.
-
-The lifecycle matters because each object answers a different debugging question:
-
-| Question | Primary object |
-| --- | --- |
-| Which product workflow ran? | Trace |
-| Which step was slow, wrong, or missing? | Observation |
-| What did the model see and return? | Generation |
-| Which documents or tools influenced the answer? | Retriever/tool observations |
-| Was the answer good? | Score |
-| Can we reproduce and compare fixes? | Dataset and experiment |
-| Did a release change quality, latency, or cost? | Metrics and trace dimensions |
+You can stop after the core model if your goal is reading an existing trace. To emit the same
+three-observation tree yourself, continue to [the SDK smoke run](02_python_sdk_v4.md#run-one-complete-sso-workflow).
+The remaining sections refine where each field belongs; prompt management has separate cache
+state because the question “which version actually ran?” requires it.
 
 ## 📦 Core Objects
 
@@ -161,6 +162,14 @@ The `input_delta` wrapper above is a Langfuse manual-observation shape, not the 
 
 Langfuse can infer usage when it has a tokenizer and can infer cost when usage plus a matching model-price definition are available. Provider/SDK-supplied usage is preferred to inferred usage. User-supplied `usage_details` and `cost_details` take precedence over inferred values; supplied cost is used verbatim, so provide it only for an authoritative provider charge or custom agreement. Usage detail buckets must be mutually exclusive or totals and inferred cost can be double-counted.
 
+For example, an inclusive provider count says input=820, including 600 cache-hit tokens,
+and output=164. Store `{"input": 220, "input_cached_tokens": 600, "output": 164}`.
+Then the total is 220 + 600 + 164 = 984. Storing input=820 *and* cached=600 yields 1584;
+600 tokens have been counted twice. If your provider instead reports uncached input separately,
+do not subtract the cached count again. Match bucket keys to the project's pricing definition;
+correct totals alone do not guarantee correct cached-token pricing.
+[Usage contract, checked 2026-10-14](https://langfuse.com/docs/observability/features/token-and-cost-tracking).
+
 > ⚠️ **Watch out:** If usage detail buckets overlap, token totals and inferred cost will be silently double-counted with no error from Langfuse.
 
 Layered explanation:
@@ -233,7 +242,7 @@ Layered explanation:
 
 `user_id` lets you analyze behavior, cost, and quality by end user or account. `session_id` groups multiple traces into a conversation or workflow.
 
-In production, use stable internal identifiers, not raw email addresses or personally identifiable values. If your privacy model requires anonymization, hash or tokenize user identifiers before sending them to Langfuse.
+In production, use stable internal identifiers, not raw email addresses or personally identifiable values. If your privacy model requires anonymization, use an approved keyed pseudonym or token before sending them to Langfuse. A plain hash of a guessable email can be reversed by hashing candidate emails; it is not anonymization. Pseudonyms remain personal data when they can be linked back to a person.
 
 Layered explanation:
 
@@ -343,6 +352,39 @@ with propagate_attributes(prompt=prompt):
 ```
 
 Propagation links only generation observations. A prompt set explicitly on a generation wins over the propagated prompt.
+
+A prompt **label** is a movable pointer: `production` may point to v17 now and v18 after
+promotion. A fetched prompt object carries a concrete version; linking that object to the generation
+records what actually ran, rather than whichever version the label points to when you investigate.
+The cache below explains why two instances can temporarily execute different versions:
+
+```mermaid
+sequenceDiagram
+  participant A as SSO application
+  participant C as local prompt cache
+  participant L as Langfuse prompt service
+  A->>C: t=0 get production, TTL 300s
+  C->>L: fetch support-answer
+  L-->>C: v17
+  C-->>A: compile v17
+  Note over L: t=100 production promoted to v18
+  A->>C: t=200 get production
+  C-->>A: fresh cached v17
+  A->>C: t=301 get production
+  C-->>A: stale v17 while revalidating
+  C->>L: background fetch
+  L-->>C: v18
+  A->>C: next get after refresh
+  C-->>A: v18
+```
+
+Moving the label did not invalidate every process's cache. The t=301 request can still run v17;
+its generation must link v17. For an experiment, pin `version=18` instead of comparing a moving
+label. On a cold process with no cached value and an unavailable service, a configured fallback
+can run, but it has no persisted prompt version. The fallback flag distinguishes that evidence
+from a managed version. [Cache semantics](https://langfuse.com/docs/prompt-management/features/caching),
+checked 2026-10-14. Fetch errors and caching policy need acceptance tests for your SDK version;
+[production operation](04_production_observability.md) owns rollout and rollback decisions.
 
 Prompt fetches use a client cache. Fresh entries return locally; expired entries can be served stale while background revalidation runs. Pre-fetch at startup if an instance must not accept traffic without the managed prompt. A `fallback=` value covers a first fetch when both cache and network are unavailable:
 
@@ -529,3 +571,38 @@ Every important LLM trace should answer:
 - Link prompt/workflow versions to traces and experiments.
 - Convert reviewed production failures into dataset items with source trace or observation IDs.
 - Keep the same terminology and field casing across services.
+
+## Rebuild the model from memory
+
+- A successful provider call says that work completed; approved generation evidence explains the answer.
+- One trace ID joins the root task and children; parent IDs show which step owns each child.
+- A later score targets retained identity; a dataset preserves a reviewed task for a new experiment.
+- Exclusive token buckets prevent double counting; cache labels and concrete versions are different state.
+
+**Q: The model cites r3 correctly, but r3 contains obsolete instructions. Should citation presence pass mean answer correctness passes?**
+
+<details><summary>Answer</summary>
+
+No. Citation presence checks an identifier, while correctness compares the answer to current approved
+instructions. The retriever's r3 evidence explains the mistake. Fix the source and add a correctness
+regression case; do not reinterpret the citation score as a correctness score.
+
+</details>
+
+**Q: A feedback handler creates trace B after answer trace A ended. Where should answer correctness be scored?**
+
+<details><summary>Answer</summary>
+
+Target stored trace A, or its generation ID if judging only that invocation. Trace B measures the
+feedback handler. The original observations do not need reopening to attach a later judgment.
+
+</details>
+
+**Q: Input=820 includes 600 cached tokens. You store input=820, cached=600, output=164. What fails first?**
+
+<details><summary>Answer</summary>
+
+The represented total becomes 1584 instead of 984. Convert inclusive input into input=220 plus
+cached=600. Then check the matching model-price definition; pricing is a separate mapping.
+
+</details>
