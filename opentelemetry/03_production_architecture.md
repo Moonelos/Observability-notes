@@ -160,6 +160,29 @@ Gateway:
 
 This pattern gives both local resilience and centralized policy.
 
+Which hop becomes unavailable when the shared telemetry network fails? This
+agent-to-gateway deployment makes the ownership boundaries explicit:
+
+```mermaid
+flowchart LR
+  subgraph Node[Application node]
+    S[service process SDK] -->|OTLP to local endpoint| A[local agent Collector]
+  end
+  subgraph Shared[Shared telemetry network]
+    G[gateway Collector]
+  end
+  A -->|batched OTLP over network| G
+  G -->|export with backend credentials| B[Backend]
+```
+
+If the shared network fails, the service can still reach its local agent. The
+agent's finite queue buffers accepted work until it fills or its retry deadline
+expires; local reachability does not guarantee eventual backend receipt. Direct
+to gateway removes that local buffering hop. A sidecar puts the same agent role
+inside the application's pod, so pod termination also ends that buffer unless
+its configured storage survives. A backend outage instead breaks the last hop;
+the gateway's own finite queue is the next boundary to inspect.
+
 ## 🔀 Signal-Specific Pipelines
 
 Do not assume traces, metrics, and logs should travel to the same backend.
@@ -334,6 +357,12 @@ exporters:
       api-key: "${env:APM_API_KEY}"
 
   prometheus_remote_write:
+    timeout: 10m
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 10m
     endpoint: https://prometheus.example.com/api/v1/write
     headers:
       authorization: "Bearer ${env:PROMETHEUS_TOKEN}"
@@ -368,6 +397,12 @@ service:
 ```
 
 This is a deployment template with placeholder endpoints and credentials. For pinned Contrib 0.158.0, remote-write `endpoint` and `headers` belong directly under the exporter, as shown in the [release schema](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.158.0/exporter/prometheusremotewriteexporter/README.md) (checked 2026-10-14); there is no nested `http` object. Validate using that exact distribution before supplying real destinations. This is the destination-specific split in configuration form. The same receiver feeds two trace pipelines. Langfuse receives approved, application-masked LLM input/output after universal secret fields are removed. The general APM backend receives the same trace shape, timing, status, model, and usage attributes after payload fields are removed. Named events now travel through the logs pipeline, where the same sensitive payload attributes are removed and every body is suppressed by default. Replace that conservative body rule only after defining and testing a log-body masker.
+
+The historical .158 remote-write exporter couples the HTTP timeout to its
+whole retry loop. Both bounds above are ten minutes to avoid the default
+five-second loss boundary. This remains finite, non-durable buffering; use the
+[controlled outage test and upgrade qualification](../examples/03_collector_prometheus_langfuse.md#qualify-remote-write-recovery-on-the-historical-pin)
+before claiming backend recovery.
 
 Watch where the same approved input diverges. The destination-specific transform sits only on the APM trace branch, and the log branch has its own body policy.
 
@@ -433,6 +468,14 @@ Reasons:
 Some processors are signal-specific. A processor referenced by multiple
 pipelines gets a separate instance per pipeline.
 
+**Upgrade context — GA, checked 2026-10-28:** OTTL (OpenTelemetry Transformation
+Language), used by `transform/redact_apm`, reaches v1 in Contrib 0.164.0. Its
+standard syntax and functions gain 1.x compatibility; experimental functions and
+profiles remain outside that promise. This does not make every component using
+OTTL stable, or change the historical 0.158.0 schema above. See the
+[upgrade gates](deployment/06_security_operations_and_upgrades.md#6--upgrade-image-chart-and-config-separately)
+before changing bundles. [OTTL v1 announcement](https://opentelemetry.io/blog/2026/ottl-v1/).
+
 ## 🗄️ Langfuse In A Collector Pipeline
 
 Langfuse accepts traces through an OTLP HTTP endpoint. Use a Collector
@@ -451,15 +494,14 @@ The `otlphttp` exporter appends the signal path for the traces pipeline. Do not
 append `/v1/traces` unless the specific exporter or backend configuration
 requires it.
 
-`x-langfuse-ingestion-version: "4"` is not a general OTLP requirement. It opts direct OTel ingestion into Langfuse Cloud Fast Preview so v2 observation/metrics views receive the current ingestion path in real time. Keep it for that path. Omit the header when the project intentionally uses the legacy ingestion behavior or a self-hosted deployment does not support/enable the preview:
-
-```yaml
-exporters:
-  otlphttp/langfuse_without_fast_preview:
-    endpoint: https://langfuse.example.com/api/public/otel
-    headers:
-      Authorization: "Basic ${env:LANGFUSE_AUTH_STRING}"
-```
+`x-langfuse-ingestion-version: "4"` selects real-time raw OTLP ingestion
+on Langfuse's v4 data model; it is not a general OTLP requirement. Server v4
+is GA as checked 2026-10-28. Without the header, data can take up to 15 minutes
+to appear. For self-hosting, check the actual server version and ingestion
+configuration, including any direct-ingestion override, rather than using
+preview availability as the decision. The pinned Collector example retains the
+header. Langfuse Cloud removes legacy ingestion on **2026-11-16**; qualify a
+migration before that date. [Versions and compatibility](https://langfuse.com/docs/compatibility).
 
 Important Langfuse routing rules:
 

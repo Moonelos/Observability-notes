@@ -1,6 +1,6 @@
 # Evaluation, Metrics, and Alerting
 
-Pinned baseline retained; local gate execution and current evaluator/alert research checked 2026-10-14.
+Pinned baseline retained; local gate retained; experiment and export migration research checked 2026-10-28.
 
 Role: implementation. Read [the data model](01_overview_data_model.md),
 [SDK IDs and lifecycle](02_python_sdk_v4.md), and [the worked incident](04_production_observability.md)
@@ -518,6 +518,22 @@ Experiment design checklist:
 - Track latency, token usage, cost, safety, and quality.
 - Inspect failures manually before promotion.
 
+### Keep experiment identity separate from display names
+
+The v4 examples above remain the executable teaching baseline. As an optional v5 continuation,
+Python v5.0.3 adds caller-supplied `experiment_id` to `run_experiment`. A coordinator can persist
+one deliberately chosen ID for the candidate experiment and pass it to distributed or resumed
+workers. Equal `run_name` strings alone are display labels, not proof that workers target the same
+experiment. Reuse identity only for the intended experiment; a new candidate needs its own identity.
+[5.0.3 release](https://github.com/langfuse/langfuse-python/releases/tag/v5.0.3), checked 2026-10-28.
+
+For example, if worker B resumes after A completed the common case, compare the persisted expected
+item IDs against received results before scheduling work. Shared experiment identity does not make
+replayed task execution, model charges or score writes automatically idempotent. Preserve item IDs,
+reject duplicate results and require all critical cases using the gate below. This continuation
+needs a compatible v5/server bundle and hosted verification; do not add the new argument to the
+pinned v4 snippet.
+
 ## Reject an improved mean when a critical case fails
 
 Freeze dataset `support-rag-regression` at the chosen version timestamp. Both runs must use the
@@ -573,6 +589,36 @@ stochastic differences matter, and reviewed failure traces. This tiny fixture te
 critical/segment decision, not a statistically powered benchmark or hosted experiment verification.
 A production job must persist its result and exit nonzero on rejection; `main()` here exits zero
 because rejection is the expected tested behavior.
+
+### Inspect the same gate in a hosted experiment
+
+The October 19 comparison UI adds charts across runs, baseline summary statistics and per-item
+score-threshold filters. In a staging project, choose the reviewed same-snapshot baseline, chart
+quality alongside cost/latency, then compare candidate items filtered below the safety/citation
+threshold. In the worked example, the better mean still leads to the failing `safety` row; open
+its trace and inspect the actual output before correcting or annotating it. UI statistics support
+inspection, while the explicit critical and coverage policy still decides promotion.
+[Experiment comparison release](https://langfuse.com/changelog/2026-10-19-experiments), checked 2026-10-28.
+This hosted workflow is not certified by the deterministic local fixture.
+
+### Preserve score lineage in warehouse exports
+
+A warehouse score of 0.72 is ambiguous if the evaluator definition or annotation origin is lost.
+Scheduled blob exports now offer two opt-in groups: `score_metadata` adds custom metadata;
+`score_provenance` adds origin identifiers, including evaluator/rule/config/annotation information
+and `execution_trace_id` for the evaluator's own run. Enable them in the integration's field
+selection only when approved for that destination. Both are off by default and affect future
+exports; older files are not backfilled.
+[Score-export release](https://langfuse.com/changelog/2026-10-22-blob-storage-score-field-groups), checked 2026-10-28.
+
+After enabling them in staging, inspect the next export of a known synthetic score and join its
+score ID to the retained evaluator version and dataset snapshot. Follow a present execution trace
+ID to debug the judge; do not confuse the judge's trace with the answer being scored. Compare that
+new file with an old file: missing provenance in the old file means unavailable evidence, not a
+human-authored score or a missing evaluator. Preserve the schema/config change time and apply the
+same access and retention policy to reviewer identifiers and custom metadata. Revert field selection
+if downstream schema or privacy checks fail; that rollback cannot remove columns already exported.
+Blob storage, export receipt and warehouse joins remain external verification gates.
 
 ## ✅ Release Gates
 

@@ -378,6 +378,28 @@ Safe sequence:
 9. Roll gradually while preserving disruption budget and capacity.
 10. Keep the previous image, chart, config, and secret schema ready for rollback.
 
+### Two current schema boundaries to test explicitly
+
+Checked 2026-10-28; these are migration context for the pinned .157 bundle.
+
+- **GA — OTTL v1, Contrib 0.164.0:** standard language compatibility does not
+  cover experimental functions or profiles. Check intervening `pkg/ottl`
+  changes and remove retired gates, including `ottl.set.allowNil`, only in the
+  target bundle. Replay the existing secret canaries and verify both destination
+  payloads after parsing succeeds. [OTTL v1](https://opentelemetry.io/blog/2026/ottl-v1/).
+- **PREVIEW — hostmetrics process conventions, introduced in 0.160.0:** versioned
+  RC definitions can change names, types and attributes. The
+  `scraper.process.EmitV1SystemConventions` gate selects the newer form on its
+  introducing release. For example, process CPU labels change from `state` to
+  `cpu.mode`; unchanged dashboards can lose their selector even while scraping
+  succeeds. Compare emitted series and adapt rules on the target version;
+  do not add that gate to .157. [Process scraper RC](https://opentelemetry.io/blog/2026/hostmetrics-process-scraper-rc/).
+
+The remote-write .158 bundle has a separate timeout/retry limitation and measured
+workaround in [the routing example](../../examples/03_collector_prometheus_langfuse.md#qualify-remote-write-recovery-on-the-historical-pin).
+Do not infer its behavior from the .157 OTLP delivery canary: different exporters
+own different retry implementations.
+
 Do not combine a distribution change, topology change, tail-sampling policy
 change, and backend migration in one unobservable rollout.
 

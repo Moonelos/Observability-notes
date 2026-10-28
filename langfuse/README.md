@@ -1,6 +1,6 @@
 # Langfuse Guide
 
-Teaching baseline: Python SDK 4.17.0; server-v4 observation-first model. Migration research checked 2026-10-14.
+Teaching baseline: Python SDK 4.17.0; server-v4 observation-first model. Migration research checked 2026-10-28.
 
 Langfuse is an observability, evaluation, prompt management, and metrics platform for LLM applications. It is built on OpenTelemetry, but it adds LLM-specific concepts that general observability backends do not usually understand well: prompts, generations, model usage, cost, user feedback, scores, datasets, experiments, and review workflows.
 
@@ -181,7 +181,7 @@ The main design goal is not "capture everything." It is "capture enough safe con
 
 ## What's changing
 
-Checked 2026-10-14. SDK major numbers and server major numbers are independent. This course keeps
+Checked 2026-10-28. SDK major numbers and server major numbers are independent. This course keeps
 its executable **Python SDK 4.17.0** baseline so its examples remain reproducible; new deployments
 should assess the GA upgrade after testing the server/API compatibility boundary.
 
@@ -193,6 +193,10 @@ should assess the GA upgrade after testing the server/API compatibility boundary
 | GA | Historical evaluator backfill | Budget judge cost and distinguish old observation time from new evaluation time; it cannot restore dropped traces. |
 | GA | Dedicated `scores-boolean` view and native boolean-score alerts | Use true-rate aggregation for pass/fail scores; validate server availability and no-data behavior. |
 | GA | Multi-message evaluator prompts and multimodal evaluation | Optional extension: requires compatible judge/provider media support and reviewed delivery/size/privacy policy. |
+| GA | Project API-key permissions | Provision Ingestion, Scores ingestion or Viewer keys for their specific jobs; test allowed and denied operations in [04](04_production_observability.md#rotate-keys-without-losing-the-delivery-proof). Existing keys retain their permissions. |
+| GA | SDK v5.0.3/5.0.4 lifecycle fixes and caller-owned experiment identity | Add final-score receipt and actual worker shutdown to the [02 upgrade gates](02_python_sdk_v4.md#qualify-a-v5-lifecycle-upgrade); preserve a deliberate experiment ID across resumed workers in [05](05_evaluation_metrics_alerting.md#keep-experiment-identity-separate-from-display-names). |
+| GA | Experiment charts, baseline statistics and item score thresholds | Inspect critical cases as well as summary improvements; [05](05_evaluation_metrics_alerting.md#inspect-the-same-gate-in-a-hosted-experiment) connects the UI to the existing local gate. |
+| GA | Opt-in score metadata/provenance blob exports | Enable fields deliberately and validate the next file; earlier exports are unchanged. See [05](05_evaluation_metrics_alerting.md#preserve-score-lineage-in-warehouse-exports). |
 
 Sources: [compatibility matrix](https://langfuse.com/docs/compatibility),
 [v4-to-v5 migration](https://langfuse.com/docs/observability/sdk/upgrade-path/python-v4-to-v5),
@@ -218,10 +222,10 @@ is GA for terminal/automation access, conditional on approved API credentials an
 
 **PREVIEW / roadmap, not a released guarantee:** the
 [current roadmap](https://langfuse.com/docs/roadmap) lists a Langfuse Gateway, multi-span/session/
-trajectory evaluation, transcript and proactive-issue-detection work, plus finer API-key permissions.
+trajectory evaluation, transcript and proactive-issue-detection work.
 These directional items do not replace this course's tested ingestion or evaluation path.
 [Organization feature previews](https://langfuse.com/changelog/2026-08-25-organization-feature-previews)
-provide opt-in controls; turning a preview on does not make its API stable. Checked 2026-10-14.
+provide opt-in controls; turning a preview on does not make its API stable. API-key permissions moved to GA on October 16; they are no longer a roadmap dependency.
 
 The researched GA changes supersede the old preview framing; experimental integrations still
 require their own locked-version contract. No preview feature is necessary for this path.
@@ -232,3 +236,18 @@ with an exact new lockfile. Compare parent IDs, usage, score targets and query o
 only after delivery and evaluation gates pass; retain the tested compatible server/config/client
 bundle for rollback. A client downgrade cannot undo a server storage migration, so test the
 server's documented downgrade boundary separately.
+
+
+The October additions above are documented in the [key-permissions release](https://langfuse.com/changelog/2026-10-16-project-api-key-permissions),
+[SDK 5.0.3](https://github.com/langfuse/langfuse-python/releases/tag/v5.0.3),
+[SDK 5.0.4](https://github.com/langfuse/langfuse-python/releases/tag/v5.0.4),
+[experiment comparison release](https://langfuse.com/changelog/2026-10-19-experiments) and
+[score-export release](https://langfuse.com/changelog/2026-10-22-blob-storage-score-field-groups),
+checked 2026-10-28. These are migration continuations; the local v4 lab retains its exact pin.
+
+**GA, conditional self-hosting upgrade:** from server 4.71.0, the web/worker images use hardened
+UBI 9 bases without `curl`, Python or a package manager. Review custom images and health probes;
+use the supported probe/build approach before rollout. Government-edition FIPS mode also requires
+the licensed deployment, host and validated-module conditions; enabling a variable alone does not
+make Langfuse a FIPS-validated product. Full server installation remains outside this course.
+[Hardened-image and FIPS release](https://langfuse.com/changelog/2026-10-23-fips-mode), checked 2026-10-28.

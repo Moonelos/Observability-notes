@@ -349,6 +349,8 @@ exporters:
       max_elapsed_time: 10m
 
   prometheus_remote_write:
+    # Historical .158 workaround: timeout also bounds the entire retry loop.
+    timeout: 10m
     endpoint: https://prometheus.example.com/api/v1/write
     translation_strategy: UnderscoreEscapingWithoutSuffixes
     resource_to_telemetry_conversion:
@@ -425,6 +427,53 @@ Validate Collector config before deployment:
 otelcol validate --config collector.yaml
 ```
 
+### Qualify remote-write recovery on the historical pin
+
+On Contrib 0.158.0, `timeout` bounds the entire remote-write retry loop. Leaving
+its five-second default can discard a sample during an eight-second outage even
+with `max_elapsed_time: 10m`. The template therefore sets **both** to ten
+minutes. This workaround extends the coupled bound; it does not make ten minutes
+of outage lossless under arbitrary load. Queues remain finite and this
+`remote_write_queue` has no durable storage. [Reproduced upstream issue](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/51983)
+(checked 2026-10-28).
+
+Run this controlled transport test from the repository root with Contrib 0.158.0:
+
+```bash
+python3 examples/local/remote_write_recovery_test.py /path/to/otelcol-contrib
+```
+
+It sends one uniquely named OTLP metric point, holds a loopback backend at 503
+for eight seconds after the first export attempt, then restores 200. Success
+prints `PASS original remote-write payload recovered after 8s outage`: the
+successful compressed request must equal the original failed request, with no
+second OTLP emission. This proves receipt of the original payload at a local
+protocol fixture, not acceptance by a real Prometheus database. To reproduce the
+old failure, append `--default-timeout`; its expected result is zero receipts
+and a deadline-exceeded log. If recovery fails, keep promotion blocked, inspect
+send/deadline logs and queue pressure, repair the timeout/configuration bundle,
+and emit a fresh canary; already dropped samples need a separately owned replay
+source.
+
+**GA upgrade context:** Contrib 0.164.0 fixes the timeout/retry coupling and
+backoff growth. Qualify that release as a new bundle with the same outage test,
+representative traffic and backend queries before shortening request timeouts.
+For an explicitly chosen 0.164.0 candidate, run the same payload-receipt fixture:
+
+```bash
+python3 examples/local/remote_write_recovery_test.py /path/to/otelcol-contrib-0.164.0 --expected-version 0.164.0
+```
+
+That candidate command is **not run here**; it is an upgrade gate, not evidence
+that this collection validated 0.164.0. The fixture retains the historical
+exporter settings, so validating shorter per-attempt timeout semantics also
+requires a reviewed candidate configuration and repeated outage test.
+
+The historical workaround also permits long waits for an unresponsive HTTP
+peer; monitor request latency and finite queue occupancy. Schema validation
+alone proves neither recovery nor capacity. [Release correction](https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/tag/v0.164.0)
+(checked 2026-10-28).
+
 ## 🔌 Langfuse Authentication and Region
 
 > ⚠️ **Watch out:** Store the auth string in a secret manager, not a ConfigMap or committed `.env` file — it encodes your full Langfuse ingestion credentials.
@@ -450,7 +499,7 @@ export LANGFUSE_OTEL_ENDPOINT="https://cloud.langfuse.com/api/public/otel"
 
 > 💡 **Key insight:** `LANGFUSE_AUTH_STRING` is your existing public/secret key pair Base64-encoded — it is not a new credential to provision or rotate independently.
 
-Store the keys and encoded value in a secret manager, not a ConfigMap or committed `.env` file. Restrict the storage directory for `file_storage`; it contains telemetry buffered during outages. The `x-langfuse-ingestion-version: 4` header opts raw OTLP spans into Langfuse Cloud Fast Preview so v2 views update in real time.
+Store the keys and encoded value in a secret manager, not a ConfigMap or committed `.env` file. Restrict the storage directory for `file_storage`; it contains telemetry buffered during outages. The `x-langfuse-ingestion-version: 4` header selects real-time raw OTLP ingestion on the GA v4 data model. Its omission can delay visibility; choose by actual server/version and ingestion mode. Cloud legacy ingestion ends 2026-11-16. See [compatibility](https://langfuse.com/docs/compatibility) (checked 2026-10-28) and [the routing explanation](../opentelemetry/03_production_architecture.md#-langfuse-in-a-collector-pipeline).
 
 ## 🗺️ Application Environment
 
@@ -564,6 +613,13 @@ If a Python service uses the Langfuse SDK directly, it can still export Langfuse
 - Collector export: best when platform teams centralize telemetry.
 
 ## 🔔 Alert Rules
+
+**Conditional prerequisite:** if you have not worked through PromQL rates,
+aggregation, vector-label matching and pending/firing state, read
+[Custom metrics and alerting](../opentelemetry/05_custom_metrics_alerting.md)
+first. Existing OTel instrumentation knowledge does not supply these query
+rules. You can stop at the capture/routing baseline above before taking this
+alerting continuation.
 
 These rules match the configured `UnderscoreEscapingWithoutSuffixes` strategy and the stable HTTP semantic convention. Resource-to-telemetry conversion supplies `service_name` and `deployment_environment_name`. Inspect actual series before enabling pages.
 
@@ -1007,12 +1063,14 @@ Separate destination pipelines own separate content and retention policies. The 
 1. Every critical trace appears when the fallback is 100%. Has each critical policy passed?
 2. Why does a trace carrying `llm.workflow="true"` fail the boolean workflow gate?
 3. Does a local Prometheus scrape prove an authenticated remote-write destination received the samples?
+4. The .158 timeout and retry bound are both ten minutes. Does the eight-second recovery test prove a twelve-minute outage will recover?
 
 <details><summary>Reasoned answers</summary>
 
 1. No. The fallback alone can retain them. Isolate named policies and include negative cases before testing the assembled policy interactions.
 2. It is a string, while the policy requires a typed boolean. The SDK preserves this distinction in OTLP; do not use string truthiness as instrumentation semantics.
 3. No. It proves local aggregation/mapping/exposure. Remote transport, authentication, tenant routing and backend queryability need a separate integration gate.
+4. No. Twelve minutes exceeds the configured bounds, and finite queues can fill even sooner under load. The test proves one original payload survived eight seconds, not a larger recovery budget. Already dropped points need a separate replay source.
 
 </details>
 

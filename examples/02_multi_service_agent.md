@@ -246,7 +246,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, OpenAI
 from opentelemetry import metrics
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import BaseModel, Field
@@ -256,7 +256,7 @@ from privacy import safe_text
 
 MAX_STEPS = 5
 MODEL = "gpt-4o-mini"
-openai = OpenAI()
+openai = OpenAI(max_retries=0, timeout=1.0)
 meter = metrics.get_meter("example.agent")
 
 agent_steps = meter.create_histogram("agent.steps", unit="{step}")
@@ -397,62 +397,78 @@ def execute_agent(request: RunRequest) -> dict:
                 "gen_ai.provider.name": "openai",
                 "gen_ai.request.model": MODEL,
             }
-            started = time.perf_counter()
-            outcome = "success"
-
-            with langfuse.start_as_current_observation(
-                as_type="generation",
-                name="llm.decide",
-                model=MODEL,
-                input={
-                    "messages": [
-                        {"role": m["role"], "content": safe_text(str(m.get("content", "")))}
-                        for m in messages[-8:]
-                    ]
-                },
-                model_parameters={"temperature": 0.1},
-            ) as generation:
+            for attempt in range(1, 3):
                 try:
-                    response = openai.chat.completions.create(
+                    started = time.perf_counter()
+                    outcome = "success"
+                    attempt_error = None
+
+                    with langfuse.start_as_current_observation(
+                        as_type="generation",
+                        name="llm.decide",
                         model=MODEL,
-                        messages=messages,
-                        tools=TOOLS,
-                        tool_choice="auto",
-                        temperature=0.1,
-                    )
-                    choice = response.choices[0]
-                    message = choice.message
-                    usage = response.usage
-                    if usage is not None:
-                        token_usage.record(usage.prompt_tokens, metric_attrs | {"gen_ai.token.type": "input"})
-                        token_usage.record(usage.completion_tokens, metric_attrs | {"gen_ai.token.type": "output"})
-                    generation.update(
-                        output={
-                            "finish_reason": choice.finish_reason,
-                            "content": safe_text(message.content or ""),
-                            "tool_names": [
-                                call.function.name if call.function.name in {"search_docs", "lookup_account"}
-                                else "unsupported_tool"
-                                for call in (message.tool_calls or [])[:5]
-                            ],
+                        input={
+                            "messages": [
+                                {"role": m["role"], "content": safe_text(str(m.get("content", "")))}
+                                for m in messages[-8:]
+                            ]
                         },
-                        usage_details={
-                            "input_tokens": usage.prompt_tokens,
-                            "output_tokens": usage.completion_tokens,
-                        } if usage is not None else None,
-                    )
+                        model_parameters={"temperature": 0.1},
+                    ) as generation:
+                        try:
+                            response = openai.chat.completions.create(
+                                model=MODEL,
+                                messages=messages,
+                                tools=TOOLS,
+                                tool_choice="auto",
+                                temperature=0.1,
+                            )
+                            choice = response.choices[0]
+                            message = choice.message
+                            usage = response.usage
+                            if usage is not None:
+                                token_usage.record(usage.prompt_tokens, metric_attrs | {"gen_ai.token.type": "input"})
+                                token_usage.record(usage.completion_tokens, metric_attrs | {"gen_ai.token.type": "output"})
+                            generation.update(
+                                output={
+                                    "finish_reason": choice.finish_reason,
+                                    "content": safe_text(message.content or ""),
+                                    "tool_names": [
+                                        call.function.name if call.function.name in {"search_docs", "lookup_account"}
+                                        else "unsupported_tool"
+                                        for call in (message.tool_calls or [])[:5]
+                                    ],
+                                },
+                                usage_details={
+                                    "input_tokens": usage.prompt_tokens,
+                                    "output_tokens": usage.completion_tokens,
+                                } if usage is not None else None,
+                            )
+                        except Exception as exc:
+                            outcome = "error"
+                            error_type = type(exc).__name__
+                            llm_failures.add(1, metric_attrs | {"error.type": error_type})
+                            generation.update(level="ERROR", status_message=error_type)
+                            attempt_error = exc
+                            # The observation records only the bounded error class.
+                            raise RuntimeError(error_type) from None
+                        finally:
+                            llm_duration.record(
+                                time.perf_counter() - started,
+                                metric_attrs | {"app.outcome": outcome},
+                            )
                 except Exception as exc:
-                    outcome = "error"
-                    error_type = type(exc).__name__
-                    llm_failures.add(1, metric_attrs | {"error.type": error_type})
-                    generation.update(level="ERROR", status_message=error_type)
-                    agent.update(level="ERROR", status_message="model_call_failed")
-                    raise HTTPException(status_code=503, detail="model unavailable") from exc
-                finally:
-                    llm_duration.record(
-                        time.perf_counter() - started,
-                        metric_attrs | {"app.outcome": outcome},
+                    provider_error = attempt_error if attempt_error is not None else exc
+                    retryable = isinstance(provider_error, APIConnectionError) or (
+                        isinstance(provider_error, APIStatusError)
+                        and (provider_error.status_code in {408, 409, 429} or provider_error.status_code >= 500)
                     )
+                    if attempt == 2 or not retryable:
+                        agent.update(level="ERROR", status_message="model_call_failed")
+                        raise HTTPException(status_code=503, detail="model unavailable") from exc
+                    time.sleep(0.1)
+                else:
+                    break
 
             messages.append(message.model_dump(exclude_none=True))
             if not message.tool_calls:
@@ -500,6 +516,10 @@ def run_agent(request: RunRequest, identity=Depends(require_gateway)) -> dict:
     )
 ```
 
+Each decision permits at most two provider attempts; `MAX_STEPS` still counts decisions, so five decisions can cause ten physical requests. `max_retries=0` prevents an invisible third layer of SDK retries. A 500 closes the failed `llm.decide` generation before the 100 ms wait; the next attempt starts a sibling generation. Only a successful decision appends a model message or executes tools, so a transport retry does not replay an already selected tool. Only a sanitized error-class marker crosses the observation context; raw SDK exception messages stay out of telemetry. Failed attempts with no usage report leave token consumption unknown. The attempt timer excludes backoff; the parent agent includes it.
+
+The one-second timeout is a teaching setting to leave room inside the gateway's 20-second network timeout, not an end-to-end guarantee. It bounds transport phases; tool latency, scheduling, gateway retries and total request lifetime still need a propagated public deadline and cancellation in production. Size the provider limit from measured latency and the remaining deadline. See the [SDK retry/timeout contract](https://github.com/openai/openai-python#retries), checked 2026-10-28. The [local transport check](01_rag_with_otel_and_langfuse.md#provider-backed-rag-continuation) executes this exact snippet with 500 → 200 and verifies two generation outcomes without external calls.
+
 The account result is no longer discarded: when selected, it becomes a tool message used by the next model decision. A failed search, account lookup, or model call records an error observation and an operational metric. Tool-call metrics are emitted once, after the final outcome is known.
 
 ## 🔍 Failure Policy
@@ -512,7 +532,7 @@ The account result is no longer discarded: when selected, it becomes a tool mess
 | Agent `4xx` | No | `502` | Treat as internal auth/contract defect |
 | Read-only tool failure | Agent can choose another step | Bounded error result or final failure | Count the execution once |
 | Write tool failure | Operation-specific only | Explicit partial/failure result | Require a tool-level idempotency key; never replay blindly |
-| Model failure | No hidden application retry in this example | Agent `503`, gateway `503` | Add bounded provider retries only if their total latency fits the deadline |
+| Model failure | One explicit retry for connection failures, 408/409/429 or 5xx; SDK retries disabled | Agent `503` after exhaustion, gateway `503` | Each physical request owns its generation and metrics; never replay write tools |
 
 Set an end-to-end deadline shorter than the public proxy timeout. Retry budgets must fit within it; otherwise retries convert a fast error into a slow error.
 

@@ -113,6 +113,19 @@ def shutdown_observability() -> None:
     langfuse.shutdown()
 ```
 
+Which owner sends each signal in Profile A? Follow the two independent paths from the same Python request:
+
+```mermaid
+flowchart LR
+  A[Python request] -->|ended observations| L[Langfuse trace provider]
+  L -->|batched OTLP HTTP traces| F[Langfuse project]
+  A -->|unsampled measurements| M[MeterProvider]
+  M -->|OTLP metrics| C[Collector]
+  C -->|aggregated series| B[Metrics backend]
+```
+
+Langfuse owns trace batching; the MeterProvider owns metric aggregation and export. Sampling a trace does not suppress the corresponding metric measurement. If direct trace export fails while metric export succeeds, a metrics dashboard can still count the request even though the Langfuse observation is absent.
+
 Initialize this module before instrumenting FastAPI or HTTPX. Call `shutdown_observability()` once from the FastAPI lifespan shutdown path, or in a `finally` block for a script.
 
 ## 🔀 Bootstrap Profile B: Centralized Collector Export
@@ -128,6 +141,22 @@ export OTEL_EXPORTER_OTLP_ENDPOINT="http://otel-collector:4318"
 export OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf"
 export OTEL_SEMCONV_STABILITY_OPT_IN="http"
 ```
+
+Profile B moves the trace destination decision across the application boundary:
+
+```mermaid
+flowchart LR
+  subgraph App[Python process]
+    R[Request] -->|one span per owned operation| T[Application TracerProvider]
+    R -->|measurements| M[MeterProvider]
+  end
+  T -->|OTLP traces| C[Collector]
+  M -->|OTLP metrics| C
+  C -->|authenticated trace export| F[Langfuse project]
+  C -->|metric export| B[Metrics backend]
+```
+
+Here only the Collector holds Langfuse backend credentials. Both signals first cross its receiver, then follow separately configured pipelines. A second direct trace exporter changes routing and can duplicate delivery; a second wrapper creates another generation identity and double-counts one model call. Diagnose those two failures separately.
 
 Configure one `TracerProvider` with an OTLP span exporter and one `MeterProvider` with an OTLP metric exporter, using [../opentelemetry/02_python_instrumentation.md](../opentelemetry/02_python_instrumentation.md). Shut down both providers once when the process exits.
 

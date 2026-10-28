@@ -79,12 +79,12 @@ import time
 from dataclasses import dataclass
 
 from langfuse import propagate_attributes
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, OpenAI
 from opentelemetry import metrics
 
 from observability import langfuse
 
-openai = OpenAI()
+openai = OpenAI(max_retries=0, timeout=1.0)
 meter = metrics.get_meter("example.rag")
 
 retrieval_documents = meter.create_histogram(
@@ -217,56 +217,72 @@ def answer_question(question: str, *, user_id: str, session_id: str) -> dict:
                 "gen_ai.provider.name": "openai",
                 "gen_ai.request.model": model,
             }
-            started = time.perf_counter()
-            outcome = "success"
-
-            with langfuse.start_as_current_observation(
-                as_type="generation",
-                name="llm.generate_answer",
-                model=model,
-                input={"messages": traced_messages},
-                model_parameters={"temperature": 0.2},
-            ) as generation:
+            for attempt in range(1, 3):
                 try:
-                    response = openai.chat.completions.create(
+                    started = time.perf_counter()
+                    outcome = "success"
+                    attempt_error = None
+
+                    with langfuse.start_as_current_observation(
+                        as_type="generation",
+                        name="llm.generate_answer",
                         model=model,
-                        messages=messages,
-                        temperature=0.2,
-                    )
-                    answer = response.choices[0].message.content or ""
-                    usage = response.usage
+                        input={"messages": traced_messages},
+                        model_parameters={"temperature": 0.2},
+                    ) as generation:
+                        try:
+                            response = openai.chat.completions.create(
+                                model=model,
+                                messages=messages,
+                                temperature=0.2,
+                            )
+                            answer = response.choices[0].message.content or ""
+                            usage = response.usage
 
-                    if usage:
-                        token_usage.record(
-                            usage.prompt_tokens,
-                            metric_attrs | {"gen_ai.token.type": "input"},
-                        )
-                        token_usage.record(
-                            usage.completion_tokens,
-                            metric_attrs | {"gen_ai.token.type": "output"},
-                        )
+                            if usage:
+                                token_usage.record(
+                                    usage.prompt_tokens,
+                                    metric_attrs | {"gen_ai.token.type": "input"},
+                                )
+                                token_usage.record(
+                                    usage.completion_tokens,
+                                    metric_attrs | {"gen_ai.token.type": "output"},
+                                )
 
-                    generation.update(
-                        output=safe_text(answer),
-                        usage_details={
-                            "input_tokens": usage.prompt_tokens,
-                            "output_tokens": usage.completion_tokens,
-                        } if usage is not None else None,
-                    )
+                            generation.update(
+                                output=safe_text(answer),
+                                usage_details={
+                                    "input_tokens": usage.prompt_tokens,
+                                    "output_tokens": usage.completion_tokens,
+                                } if usage is not None else None,
+                            )
+                        except Exception as exc:
+                            outcome = "error"
+                            error_type = type(exc).__name__
+                            operation_failures.add(
+                                1,
+                                metric_attrs | {"error.type": error_type},
+                            )
+                            generation.update(level="ERROR", status_message=error_type)
+                            attempt_error = exc
+                            # The observation records only the bounded error class.
+                            raise RuntimeError(error_type) from None
+                        finally:
+                            operation_duration.record(
+                                time.perf_counter() - started,
+                                metric_attrs | {"app.outcome": outcome},
+                            )
                 except Exception as exc:
-                    outcome = "error"
-                    error_type = type(exc).__name__
-                    operation_failures.add(
-                        1,
-                        metric_attrs | {"error.type": error_type},
+                    provider_error = attempt_error if attempt_error is not None else exc
+                    retryable = isinstance(provider_error, APIConnectionError) or (
+                        isinstance(provider_error, APIStatusError)
+                        and (provider_error.status_code in {408, 409, 429} or provider_error.status_code >= 500)
                     )
-                    generation.update(level="ERROR", status_message=error_type)
-                    raise
-                finally:
-                    operation_duration.record(
-                        time.perf_counter() - started,
-                        metric_attrs | {"app.outcome": outcome},
-                    )
+                    if attempt == 2 or not retryable:
+                        raise
+                    time.sleep(0.1)
+                else:
+                    break
 
             citation_ids = {doc.id for doc in documents}
             with langfuse.start_as_current_observation(
@@ -300,6 +316,38 @@ def answer_question(question: str, *, user_id: str, session_id: str) -> dict:
             )
             return result
 ```
+
+The SDK normally retries selected errors twice. Here `max_retries=0` gives the application ownership: a synthetic 500 ends one ERROR generation and one duration measurement; after 100 ms, a new generation owns the second HTTP request. Only connection failures, 408, 409, 429 and 5xx responses get that one retry. A 401 ends the request immediately. The observation receives a sanitized exception containing only the error class; raw provider bodies are kept out of telemetry. Missing usage on the failed request remains unknown; do not insert zero tokens or infer that the provider did no billable work. The timer restarts inside the loop, so backoff belongs to `rag.answer` latency rather than either physical attempt.
+
+For the SSO request, the parent survives the failed attempt while each generation closes before the next begins:
+
+```mermaid
+sequenceDiagram
+    participant R as rag.answer
+    participant G as llm.generate_answer
+    participant P as OpenAI transport
+    R->>G: attempt 1, fresh timer
+    G->>P: chat completion, SDK retries disabled
+    P-->>G: HTTP 500, no usage
+    G-->>R: ERROR, duration recorded
+    R->>R: wait 100 ms
+    R->>G: attempt 2, fresh timer
+    G->>P: chat completion
+    P-->>G: HTTP 200, usage 10 input + 5 output
+    G-->>R: success, duration and usage recorded
+```
+
+The two generation records share the `rag.answer` parent, rather than making the retry a child of the failed generation. One successful answer therefore does not imply one physical provider request.
+
+The one-second provider timeout is a deliberately small lab setting, chosen inside the public request budget; tune it from measured model latency. SDK transport timeouts bound network phases, so this excerpt does not enforce a hard end-to-end deadline. Before deploying, enforce the public deadline in the request owner, include retrieval and retry delay, and cancel work when that deadline expires. Two attempts can incur duplicate provider work even if the first response was lost. See the [official SDK retry and timeout options](https://github.com/openai/openai-python#retries), checked 2026-10-28.
+
+Run the local transport check from the repository root after the lab setup:
+
+```bash
+python examples/local/provider_retry_test.py
+```
+
+It executes both documented provider continuations with a real SDK and an in-memory HTTP transport: 500 → 200 must produce two HTTP requests and two generation records, the first failed without reported usage and the second successful with known usage. No paid provider or hosted Langfuse call occurs.
 
 The model-call duration is recorded in `finally`, so timeouts and provider errors are part of latency distributions. Failures also increment a counter and mark the Langfuse generation as an error. This avoids dashboards that report only successful-call latency.
 
@@ -420,6 +468,14 @@ No call occurred. A zero measurement would incorrectly imply a very fast model r
 <details><summary>Answer</summary>
 
 409 rejects a payload conflict. A retry must repeat the original operation, otherwise one key would ambiguously name two judgments.
+
+</details>
+
+**A provider returns 500, then 200 with 15 reported tokens. How many durations and token measurements belong to the request?**
+
+<details><summary>Answer</summary>
+
+Two attempt durations belong to sibling generations, with one failure measurement. Only the successful response supplies token usage: one input and one output measurement totaling 15. The first request's consumption is unknown, so neither zero nor another 15 can be inferred. The parent includes the 100 ms wait, which is absent from the two attempt durations.
 
 </details>
 

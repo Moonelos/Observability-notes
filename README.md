@@ -1,3 +1,5 @@
+git 
+
 # OpenTelemetry and Langfuse Guide
 
 Repository compatibility contract reviewed on 2026-08-10. Version-sensitive
@@ -17,13 +19,13 @@ It has three goals:
 
 ## 🧭 Start Here
 
-| Path | Use it when |
-| --- | --- |
-| [Production tracing playbook](PRODUCTION_TRACING_PLAYBOOK.md) | You want the compact production policy, rollout checklist, and links into the deeper notes. |
-| [opentelemetry/README.md](opentelemetry/README.md) | You want to deeply understand OpenTelemetry and production observability architecture. |
-| [opentelemetry/deployment/README.md](opentelemetry/deployment/README.md) | You need to deploy, discover, scale, secure, or upgrade OpenTelemetry Collectors. |
-| [langfuse/README.md](langfuse/README.md) | You want to instrument, evaluate, and operate LLM applications with Langfuse. |
-| [examples/README.md](examples/README.md) | You want concrete Python patterns for RAG, agents, multi-service propagation, metrics, and alerts. |
+| Path                                                                    | Use it when                                                                                        |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| [Production tracing playbook](PRODUCTION_TRACING_PLAYBOOK.md)            | You want the compact production policy, rollout checklist, and links into the deeper notes.        |
+| [opentelemetry/README.md](opentelemetry/README.md)                       | You want to deeply understand OpenTelemetry and production observability architecture.             |
+| [opentelemetry/deployment/README.md](opentelemetry/deployment/README.md) | You need to deploy, discover, scale, secure, or upgrade OpenTelemetry Collectors.                  |
+| [langfuse/README.md](langfuse/README.md)                                 | You want to instrument, evaluate, and operate LLM applications with Langfuse.                      |
+| [examples/README.md](examples/README.md)                                 | You want concrete Python patterns for RAG, agents, multi-service propagation, metrics, and alerts. |
 
 ## 📁 Structure
 
@@ -84,6 +86,8 @@ Already an OpenTelemetry engineer:
 4. [Langfuse OTLP ingestion and mapping](langfuse/03_otel_ingestion_and_mapping.md)
 5. [Collector, Prometheus, Langfuse, and alerts](examples/03_collector_prometheus_langfuse.md)
 
+Before the alert recipes in the last entry, take [custom metrics and alerting](opentelemetry/05_custom_metrics_alerting.md) unless you can already reason through reset-aware `rate`, aggregation, vector matching and pending/firing/no-data states. Existing OTel experience alone does not establish those query skills. The capture/routing stop point above remains useful before this continuation.
+
 Building production LLM or agent systems:
 
 **Prerequisites:** Langfuse 01–02 and OTel 01–02, or equivalent tested knowledge. New readers should take the first-time path above. **Outcome:** diagnose an index regression, reject a harmful candidate despite a higher mean, and verify authenticated multi-service instrumentation. **Stop point:** after the worked incident and release gate; continue to integration when work crosses services.
@@ -121,49 +125,58 @@ Deploying OpenTelemetry Collectors:
 
 ## 🔗 Official References
 
-- OpenTelemetry docs: <https://opentelemetry.io/docs/>
-- OpenTelemetry Python docs: <https://opentelemetry.io/docs/languages/python/>
-- OpenTelemetry span-event deprecation: <https://opentelemetry.io/blog/2026/deprecating-span-events/>
-- OpenTelemetry event semantic conventions: <https://opentelemetry.io/docs/specs/semconv/general/events/>
-- OpenTelemetry Collector docs: <https://opentelemetry.io/docs/collector/>
-- OpenTelemetry GenAI semantic conventions: <https://github.com/open-telemetry/semantic-conventions-genai>
-- Langfuse docs: <https://langfuse.com/docs>
-- Langfuse SDK overview: <https://langfuse.com/docs/observability/sdk/overview>
-- Langfuse OpenTelemetry ingestion: <https://langfuse.com/integrations/native/opentelemetry>
-- Langfuse integrations: <https://langfuse.com/integrations>
-- Langfuse Python reference: <https://python.reference.langfuse.com/langfuse>
+- OpenTelemetry docs: [https://opentelemetry.io/docs/](https://opentelemetry.io/docs/)
+- OpenTelemetry Python docs: [https://opentelemetry.io/docs/languages/python/](https://opentelemetry.io/docs/languages/python/)
+- OpenTelemetry span-event deprecation: [https://opentelemetry.io/blog/2026/deprecating-span-events/](https://opentelemetry.io/blog/2026/deprecating-span-events/)
+- OpenTelemetry event semantic conventions: [https://opentelemetry.io/docs/specs/semconv/general/events/](https://opentelemetry.io/docs/specs/semconv/general/events/)
+- OpenTelemetry Collector docs: [https://opentelemetry.io/docs/collector/](https://opentelemetry.io/docs/collector/)
+- OpenTelemetry GenAI semantic conventions: [https://github.com/open-telemetry/semantic-conventions-genai](https://github.com/open-telemetry/semantic-conventions-genai)
+- Langfuse docs: [https://langfuse.com/docs](https://langfuse.com/docs)
+- Langfuse SDK overview: [https://langfuse.com/docs/observability/sdk/overview](https://langfuse.com/docs/observability/sdk/overview)
+- Langfuse OpenTelemetry ingestion: [https://langfuse.com/integrations/native/opentelemetry](https://langfuse.com/integrations/native/opentelemetry)
+- Langfuse integrations: [https://langfuse.com/integrations](https://langfuse.com/integrations)
+- Langfuse Python reference: [https://python.reference.langfuse.com/langfuse](https://python.reference.langfuse.com/langfuse)
 
 ## Pinned teaching baseline and current compatibility
 
-Checked 2026-10-14. Historical examples retain their explicit pins; “current” does not mean silently changing an SDK major or chart. Lock resolved Python packages together and repeat the local/external gates on upgrades.
+Checked 2026-10-28. Historical examples retain their explicit pins; “current” does not mean silently changing an SDK major or chart. Lock resolved Python packages together and repeat the local/external gates on upgrades.
 
-| Component | Teaching baseline | Current migration boundary |
-|---|---|---|
-| Langfuse Python | >=4.14,<5; mixed local examples verified with 4.18.0; LF SDK smoke pins 4.17.0 | Python v5 requires Python >=3.11 and Langfuse v4 >=4.59.0/Cloud; follow the [v5 migration](https://langfuse.com/docs/observability/sdk/upgrade-path/python-v4-to-v5). |
-| Langfuse server | Existing SDK v4 course; historical preview language is scoped | Server v4 GA; Cloud legacy API/ingest removals planned 2026-11-16. Audit actual API method mappings via [compatibility](https://langfuse.com/docs/compatibility). |
-| Collector Contrib | 0.158.0 root pipeline; deployment guide 0.157.0 | Validate each exact distribution; newer components are migration candidates, not available on old pins. |
-| Helm Collector chart | Deployment 0.168.0 paired with k8s image 0.157.0 | Pin chart and image independently; render actual merged configuration before installation. |
-| OTel conventions | Core 1.44.0 plus GenAI commit 46d43c89 | GenAI remains evolving; new inference metric names require a producer/dashboard migration together. |
+| Component            | Teaching baseline                                                              | Current migration boundary                                                                                                                                           |
+| -------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Langfuse Python      | >=4.14,<5; mixed local examples verified with 4.18.0; LF SDK smoke pins 4.17.0 | Python v5 requires Python >=3.11 and Langfuse v4 >=4.59.0/Cloud; follow the [v5 migration](https://langfuse.com/docs/observability/sdk/upgrade-path/python-v4-to-v5). |
+| Langfuse server      | Existing SDK v4 course; historical preview language is scoped                  | Server v4 GA; Cloud legacy API/ingest removals planned 2026-11-16. Audit actual API method mappings via [compatibility](https://langfuse.com/docs/compatibility).     |
+| Collector Contrib    | 0.158.0 root pipeline; deployment guide 0.157.0                                | Validate each exact distribution; newer components are migration candidates, not available on old pins.                                                              |
+| Helm Collector chart | Deployment 0.168.0 paired with k8s image 0.157.0                               | Pin chart and image independently; render actual merged configuration before installation.                                                                           |
+| OTel conventions     | Core 1.44.0 plus GenAI commit 46d43c89                                         | GenAI remains evolving; new inference metric names require a producer/dashboard migration together.                                                                  |
 
 ## What's changing
 
-Checked 2026-10-14 against primary sources. These are status and migration context for the pinned lessons.
+Checked 2026-10-28 against primary sources. These are status and migration context for the pinned lessons; newer features are qualified separately from the retained baseline.
 
-| Item | Status | What to do | Source |
-|---|---|---|---|
-| Python SDK v5 / JS SDK v6 | GA | Check server and removed methods before moving majors; see Langfuse 02. | [Release](https://langfuse.com/changelog/2026-10-14-python-sdk-v5-js-sdk-v6) |
-| Langfuse server v4 and Cloud cutoff | GA / DEPRECATED | Migrate legacy API consumers by 2026-11-16; retain tested SDK v4 where compatible. | [Compatibility](https://langfuse.com/docs/compatibility) |
-| Kubernetes attributes processor v1 | GA | Diff attribute enrichment during Collector upgrades; deployment 03/06. | [Migration](https://opentelemetry.io/blog/2026/k8s-attributes-processor-v1/) |
-| Evaluator APIs, backfills and multimodal inputs | GA | Version evaluator definitions and targeting; recalibrate new inputs, Langfuse 05. | [Evaluator API](https://langfuse.com/changelog/2026-08-27-stable-evaluator-api), [backfills](https://langfuse.com/changelog/2026-09-07-evaluator-backfills), [multimodal](https://langfuse.com/changelog/2026-09-01-multi-message-prompts-and-multimodal-inputs) |
-| Boolean score aggregate view | GA | Match view to score type and server API, Langfuse 05. | [Metrics API](https://langfuse.com/docs/metrics/features/metrics-api) |
-| Cardinality overflow series | GA, SDK support varies | Monitor overflow and bounded dimensions; filtered SLO ratios can lose cohort labels, OTel 05. | [Cardinality guide](https://opentelemetry.io/blog/2026/cardinality-limits-in-opentelemetry/) |
-| Declarative configuration schema 1.0 | GA schema, language maturity varies | Check implementation support before replacing the Python bootstrap. | [Stable schema](https://opentelemetry.io/blog/2026/stable-declarative-config/) |
-| Collector 0.163 adaptive sampling and rotation | PREVIEW for alpha samplers; component-specific rotation | Test newer component schemas and rollout separately from .157/.158 pins. | [Release](https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/tag/v0.163.0) |
-| Profiles | PREVIEW, public alpha | Optional performance investigation beyond the core Python labs. | [Announcement](https://opentelemetry.io/blog/2026/profiles-alpha/) |
-| Environment-variable carrier | PREVIEW, release candidate | Consider CLI/subprocess tracing after checking language support and trust boundary. | [Proposal](https://opentelemetry.io/blog/2026/environment-variable-context-propagation/) |
-| OBI stdout/stderr trace correlation | GA, opt-in | Linux alternative with kernel/privilege/logging constraints; manual product spans still needed. | [Maintainer guidance](https://opentelemetry.io/blog/2026/obi-trace-log-correlation/) |
-| OTel-Arrow Dataflow Engine | PREVIEW | Controlled high-volume efficiency experiments; outside this baseline. | [Incubation](https://opentelemetry.io/blog/2026/otel-arrow-phase-2/) |
-| Span-event APIs | Announced gradual deprecation; SDK adoption varies | Prefer named correlated logs for new instrumentation; existing OTLP span events remain readable. | [Deprecation plan](https://opentelemetry.io/blog/2026/deprecating-span-events/) |
-| GenAI inference metric schema | PREVIEW conventions | Separate inference from non-inference operation duration and migrate queries with the producer, OTel 06. | [GenAI metrics](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/) |
+| Item                                            | Status                                                  | What to do                                                                                               | Source                                                                                                                                                                                                                                                        |
+| ----------------------------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Python SDK v5 / JS SDK v6                       | GA                                                      | Check server and removed methods before moving majors; see Langfuse 02.                                  | [Release](https://langfuse.com/changelog/2026-10-14-python-sdk-v5-js-sdk-v6)                                                                                                                                                                                   |
+| Langfuse server v4 and Cloud cutoff             | GA / DEPRECATED                                         | Migrate legacy API consumers by 2026-11-16; retain tested SDK v4 where compatible.                       | [Compatibility](https://langfuse.com/docs/compatibility)                                                                                                                                                                                                       |
+| Kubernetes attributes processor v1              | GA                                                      | Diff attribute enrichment during Collector upgrades; deployment 03/06.                                   | [Migration](https://opentelemetry.io/blog/2026/k8s-attributes-processor-v1/)                                                                                                                                                                                   |
+| Evaluator APIs, backfills and multimodal inputs | GA                                                      | Version evaluator definitions and targeting; recalibrate new inputs, Langfuse 05.                        | [Evaluator API](https://langfuse.com/changelog/2026-08-27-stable-evaluator-api), [backfills](https://langfuse.com/changelog/2026-09-07-evaluator-backfills), [multimodal](https://langfuse.com/changelog/2026-09-01-multi-message-prompts-and-multimodal-inputs) |
+| Boolean score aggregate view                    | GA                                                      | Match view to score type and server API, Langfuse 05.                                                    | [Metrics API](https://langfuse.com/docs/metrics/features/metrics-api)                                                                                                                                                                                          |
+| Cardinality overflow series                     | GA, SDK support varies                                  | Monitor overflow and bounded dimensions; filtered SLO ratios can lose cohort labels, OTel 05.            | [Cardinality guide](https://opentelemetry.io/blog/2026/cardinality-limits-in-opentelemetry/)                                                                                                                                                                   |
+| Declarative configuration schema 1.0            | GA schema, language maturity varies                     | Check implementation support before replacing the Python bootstrap.                                      | [Stable schema](https://opentelemetry.io/blog/2026/stable-declarative-config/)                                                                                                                                                                                 |
+| Collector 0.163 adaptive sampling and rotation  | PREVIEW for alpha samplers; component-specific rotation | Test newer component schemas and rollout separately from .157/.158 pins.                                 | [Release](https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/tag/v0.163.0)                                                                                                                                                             |
+| Profiles                                        | PREVIEW, public alpha                                   | Optional performance investigation beyond the core Python labs.                                          | [Announcement](https://opentelemetry.io/blog/2026/profiles-alpha/)                                                                                                                                                                                             |
+| Environment-variable carrier                    | PREVIEW, release candidate                              | Consider CLI/subprocess tracing after checking language support and trust boundary.                      | [Proposal](https://opentelemetry.io/blog/2026/environment-variable-context-propagation/)                                                                                                                                                                       |
+| OBI stdout/stderr trace correlation             | GA, opt-in                                              | Linux alternative with kernel/privilege/logging constraints; manual product spans still needed.          | [Maintainer guidance](https://opentelemetry.io/blog/2026/obi-trace-log-correlation/)                                                                                                                                                                           |
+| OTel-Arrow Dataflow Engine                      | PREVIEW                                                 | Controlled high-volume efficiency experiments; outside this baseline.                                    | [Incubation](https://opentelemetry.io/blog/2026/otel-arrow-phase-2/)                                                                                                                                                                                           |
+| Span-event APIs                                 | Announced gradual deprecation; SDK adoption varies      | Prefer named correlated logs for new instrumentation; existing OTLP span events remain readable.         | [Deprecation plan](https://opentelemetry.io/blog/2026/deprecating-span-events/)                                                                                                                                                                                |
+| GenAI inference metric schema                   | PREVIEW conventions                                     | Separate inference from non-inference operation duration and migrate queries with the producer, OTel 06. | [GenAI metrics](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/)                                                                                                                                                                            |
+| Remote-write retry deadline correction | GA, Contrib 0.164.0 | The .158 lab needs an explicit measured timeout workaround; the newer fix requires its own bundle qualification, examples 03. | [Release](https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/tag/v0.164.0) |
+| Project API-key permissions | GA | Provision separate least-privilege ingestion, score and read credentials; test rotation and denials, Langfuse 04. | [Permissions](https://langfuse.com/changelog/2026-10-16-project-api-key-permissions) |
+| OTTL v1 | GA in Contrib 0.164.0 | Language stability does not upgrade every processor; preserve old gates on old bundles, OTel 03 / deployment 06. | [OTTL v1](https://opentelemetry.io/blog/2026/ottl-v1/) |
+| SDK v5 lifecycle and experiment identity | GA, Python 5.0.3/5.0.4 | Qualify final score receipt, repeated shutdown and resumed experiment identity; Langfuse 02/05. | [5.0.3](https://github.com/langfuse/langfuse-python/releases/tag/v5.0.3), [5.0.4](https://github.com/langfuse/langfuse-python/releases/tag/v5.0.4) |
+| Experiment comparisons and score provenance exports | GA | Inspect item thresholds as well as means; new export groups do not backfill old files, Langfuse 05. | [Comparisons](https://langfuse.com/changelog/2026-10-19-experiments), [score exports](https://langfuse.com/changelog/2026-10-22-blob-storage-score-field-groups) |
+| Native histogram representation | GA, support depends on full path | Qualify aggregation, transport, storage and queries together; retain classic rules in this lab, OTel 05. | [Histogram guidance](https://prometheus.io/docs/practices/histograms/) |
+| Hostmetrics process conventions | PREVIEW, release candidate | Diff emitted names/types/attributes on versioned-definition upgrades, deployment 06. | [Process metrics](https://opentelemetry.io/blog/2026/hostmetrics-process-scraper-rc/) |
+| Hardened Langfuse images / conditional FIPS mode | GA | Check image extension and health probes; FIPS requires the supported edition and host/module setup, Langfuse README. | [Server changes](https://langfuse.com/changelog/2026-10-23-fips-mode) |
+| Legacy Zipkin exporter and compatibility requirements | DEPRECATED, staged | Migrate old instrumentation to native OTel/OTLP; deprecation does not immediately remove existing shims, OTel README. | [Zipkin](https://opentelemetry.io/blog/2025/deprecating-zipkin-exporters/), [OpenTracing](https://opentelemetry.io/blog/2026/deprecating-opentracing-compatibility/), [OpenCensus](https://opentelemetry.io/blog/2026/deprecating-opencensus-compatibility/) |
 
 [Glossary](GLOSSARY.md) links lookup terms to their teaching owners. [Architecture references](architecture/README.md) provide compact tracing and metric design lookup after the tutorials.

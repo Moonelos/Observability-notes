@@ -1,6 +1,6 @@
 # Python SDK v4
 
-Pinned SDK 4.17.0; local execution and migration research checked 2026-10-14.
+Pinned SDK 4.17.0; local baseline retained; lifecycle migration research checked 2026-10-28.
 
 ## 🧭 Mental Model
 
@@ -599,6 +599,25 @@ Short-lived process checklist:
 - Attach any scores.
 - Call `flush()` before exit.
 - Call `shutdown()` when the process is truly ending and the client should close resources.
+
+### Qualify a v5 lifecycle upgrade
+
+A worker can finish an SSO evaluation yet lose its last score if the score queue is not drained.
+Python v5.0.3 fixed immediate dispatch of pending scores on `flush()`; v5.0.4 fixed a media flush
+hang after repeated shutdown and score flushing/shutdown under gevent. These fixes belong to the
+v5 migration path; they do not establish a defect in this chapter's pinned v4 smoke.
+[5.0.3 notes](https://github.com/langfuse/langfuse-python/releases/tag/v5.0.3) and
+[5.0.4 notes](https://github.com/langfuse/langfuse-python/releases/tag/v5.0.4), checked 2026-10-28.
+
+For an upgrade candidate, create one synthetic SSO observation and a uniquely identified final
+score immediately before the worker exits. Close the observation, flush, then invoke the process's
+normal shutdown hooks under a bounded test deadline. Query the score through a separately authorized
+reader and require its original target and value; an empty local queue is insufficient proof of
+server receipt. Exercise overlapping shutdown hooks if the application has them, and the actual
+gevent worker model if used. A hang, missing score or wrong target rejects the candidate bundle;
+restore the tested compatible client/config bundle and rerun the canary. Keep new work from starting
+after shutdown. The local v4 memory-exporter smoke checks span lifecycle only, so this v5 score and
+worker-model gate remains separate and unverified here.
 
 ## 🔍 Debugging and Sampling
 

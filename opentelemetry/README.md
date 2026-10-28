@@ -96,3 +96,7 @@ References:
 - [OpenTelemetry GenAI metrics, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/46d43c8949afb53765a202e89f4534eeb75ca3fa/docs/gen-ai/gen-ai-metrics.md)
 - [OpenTelemetry GenAI agent spans, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/46d43c8949afb53765a202e89f4534eeb75ca3fa/docs/gen-ai/gen-ai-agent-spans.md)
 - [Langfuse OpenTelemetry integration](https://langfuse.com/integrations/native/opentelemetry)
+
+## Migrating legacy instrumentation
+
+Checked 2026-10-28: the Zipkin SDK-exporter specification and OpenTracing/OpenCensus compatibility requirements are deprecated in stages. New integrations should use native OTel APIs and OTLP. Existing shims do not disappear immediately: first inventory which libraries create spans, move one integration at a time, and compare trace IDs, parentage, errors and duplicate generations before removing its compatibility layer. A Zipkin backend can remain a destination through supported OTLP ingestion or a Collector exporter. See the primary [Zipkin timeline](https://opentelemetry.io/blog/2025/deprecating-zipkin-exporters/), [OpenTracing notice](https://opentelemetry.io/blog/2026/deprecating-opentracing-compatibility/) and [OpenCensus notice](https://opentelemetry.io/blog/2026/deprecating-opencensus-compatibility/).

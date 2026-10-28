@@ -83,6 +83,12 @@ exporters:
     headers:
       api-key: ${env:APM_API_KEY}
   prometheus_remote_write:
+    timeout: 10m
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 10m
     endpoint: https://prometheus.example.com/api/v1/write
     headers:
       authorization: Bearer ${env:PROMETHEUS_TOKEN}

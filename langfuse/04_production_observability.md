@@ -1,6 +1,6 @@
 # Production Observability Workflows
 
-Pinned baseline retained; incident reasoning and migration research checked 2026-10-14.
+Pinned baseline retained; incident reasoning retained; credential migration research checked 2026-10-28.
 
 ## Diagnose and recover one SSO rollout
 
@@ -325,6 +325,31 @@ Privacy review questions:
 
 ### Rotate keys without losing the delivery proof
 
+Choose the replacement key's permission before rotating it. Since October 16, project keys can
+have Full access, Viewer, Ingestion or Scores ingestion permissions; existing keys retain their
+previous access. A telemetry-only SSO service uses Ingestion (traces, scores and media), a dedicated
+feedback writer uses Scores ingestion, and a reporting job uses Viewer. An Ingestion key cannot
+fetch managed prompts or datasets: a service that does those jobs needs a separately approved
+credential design or appropriately broader permission, rather than an unexplained switch from
+its old Full access key. Never put the project secret in browser code; a server-side feedback
+endpoint still owns user/message authorization.
+[Project-key permissions](https://langfuse.com/changelog/2026-10-16-project-api-key-permissions), checked 2026-10-28.
+
+For a telemetry-only staging service, verify both sides of the boundary before rollout:
+
+| Credential | Allowed-operation proof | Denied-operation proof |
+| --- | --- | --- |
+| Ingestion | Send unique synthetic SSO trace; an independent Viewer finds its tree | An authenticated trace/prompt read is refused rather than returning project content |
+| Scores ingestion | Submit one synthetic score; Viewer confirms target and value | Trace ingestion and a project-data read are refused |
+| Viewer | Read the synthetic trace/score | A synthetic score write is refused |
+
+Use a disposable staging target and assert an authorization denial, not a network error or an
+empty successful response. If an ingestion credential correctly fails a read-based startup health
+check, change the check to an allowed operation and prove receipt with the separate reader; do not
+restore Full access merely to make the check green. These are credential-dependent acceptance
+procedures, not locally executed tests. A leaked narrow key can still submit false telemetry, so
+rotation and ingestion monitoring remain necessary.
+
 Current deployments can assign API-key expiry dates. Suppose the old project key expires Friday:
 create the approved replacement first, update the exporter secret reference, and send a new unique
 synthetic SSO canary. Require backend lookup of its full tree before retiring the old key. If export
@@ -525,6 +550,7 @@ After production rollout:
 
 - Define trace designs for chat, RAG, agent, guardrail, and evaluator workflows.
 - Decide capture, masking, retention, and access policy before broad rollout.
+- Provision job-specific key permissions; prove both allowed receipt and denied operations, and rehearse rotation before expiry.
 - Set environment, release, version, user/session, tags, and metadata consistently.
 - Use native Langfuse Monitors for supported observation/score thresholds and an external metrics/incident stack for infrastructure SLOs, unsupported signals, and escalation.
 - Preserve complete traces for errors, safety failures, negative feedback, and new releases.

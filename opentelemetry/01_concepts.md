@@ -1222,7 +1222,7 @@ If no SDK is configured, API calls are no-ops. This is intentional. A library
 can safely depend on `opentelemetry-api` and create spans without forcing an
 exporter or backend on every application that imports it.
 
-> 💡 **Key insight:** A shared library can add full instrumentation by depending only on opentelemetry-api — the application that configures the SDK decides where telemetry goes, with zero overhead in libraries that are imported without one.
+> 💡 **Key insight:** A shared library can add full instrumentation by depending only on opentelemetry-api — the application that configures the SDK decides where telemetry goes, with no recording/export pipeline and low no-op overhead when no SDK is configured. Python calls and attribute construction still cost time.
 
 ### Providers
 

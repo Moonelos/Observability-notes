@@ -357,6 +357,32 @@ Suppose ten `/chat` model calls take `1, 1, 1, 2, 2, 3, 4, 5, 7, 9` seconds. Cho
 
 The query takes `rate` per bucket series and then `sum by (le, ...)` to combine instance populations. Retaining `le` preserves the cumulative distribution. Dropping it first would add nested counts together and leave nothing for `histogram_quantile` to reconstruct. Averaging each instance's p95 also fails: an idle instance and a busy instance would receive equal weight despite serving different populations. The combined bucket population gives each request its actual weight. [Prometheus histogram quantile behavior](https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile) (checked 2026-10-14).
 
+### Choose the representation across the whole route
+
+**GA guidance, checked 2026-10-28:** Prometheus recommends native histograms
+when supported. A native sample carries its distribution together; classic
+histograms spread it across `_bucket`, `_sum` and `_count` series. OTel
+exponential histograms map to native histograms; explicit OTel buckets may
+become classic histograms or native histograms with custom bucket boundaries
+(NHCB). [Prometheus histogram guidance](https://prometheus.io/docs/practices/histograms/).
+
+For the ten `/chat` calls above, NHCB storage keeps the explicit bucket
+information; it cannot recover the discarded seven-second observation. Before
+migration, inspect SDK aggregation, Collector/transport conversion, backend
+storage and query results. Each boundary must preserve the selected type.
+
+These query excerpts assume `chat_duration_seconds` is the stored metric name:
+
+| Representation | Aggregate p90 query |
+| --- | --- |
+| Classic | `histogram_quantile(0.90, sum by (le) (rate(chat_duration_seconds_bucket[5m])))` |
+| Native, including NHCB | `histogram_quantile(0.90, sum(rate(chat_duration_seconds[5m])))` |
+
+The pinned lab keeps explicit buckets and classic queries. Compare both routes
+on a canary before changing producer, transport and rules. If storage still
+contains only classic series, the native query lacks histogram input; successful
+configuration validation cannot prove migration.
+
 ## 📤 Export Patterns
 
 Most teams export metrics through OTLP to a Collector and then to a metrics
@@ -870,7 +896,7 @@ Quality metrics:
 
 ## 🏷️ GenAI Semantic Convention Metrics
 
-The current GenAI semantic convention effort defines client metrics such as:
+The pinned historical GenAI vocabulary used by this collection defines client metrics such as:
 
 | Metric | Meaning |
 | --- | --- |
@@ -878,6 +904,16 @@ The current GenAI semantic convention effort defines client metrics such as:
 | `gen_ai.client.operation.duration` | Histogram of client operation duration. |
 | `gen_ai.client.operation.time_to_first_chunk` | Streaming time to first chunk. |
 | `gen_ai.client.operation.time_per_output_chunk` | Streaming chunk cadence. |
+
+Current inference names are `gen_ai.client.inference.duration`,
+`gen_ai.client.inference.time_to_first_chunk` and
+`gen_ai.client.inference.time_per_output_chunk`, replacing the corresponding
+`operation.*` vocabulary above for inference. Main remains Development: inspect
+and pin the schema before adoption. Migrate producer, rules and dashboards as
+one bundle, compare on a canary, and never sum old and new streams as independent
+work. [GenAI metric schema](https://raw.githubusercontent.com/open-telemetry/semantic-conventions-genai/main/model/gen-ai/metrics.yaml)
+(checked 2026-10-28); [the attempt lesson](06_genai_and_llm_observability.md)
+owns the full historical/current boundary.
 
 It also defines agent and tool metrics:
 

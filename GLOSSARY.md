@@ -82,3 +82,7 @@ Lookup aid. Follow each link for the causal explanation and worked example.
 | Fencing | Rejecting stale owners using an authoritative ownership token/version; [agent lab](examples/02_multi_service_agent.md). |
 | Outbox | Durable intent recorded with application state and delivered/reconciled separately; [RAG lab](examples/01_rag_with_otel_and_langfuse.md). |
 | GA / preview / deprecated | Released availability / provisional behavior / discouraged or scheduled removal; [landscape](README.md#whats-changing). |
+| Native histogram | Histogram sample carrying its bucket representation, requiring compatible aggregation, transport, storage and query support; [representation choice](opentelemetry/05_custom_metrics_alerting.md). |
+| OTTL | OpenTelemetry Transformation Language used by Collector transforms; its language stability is separate from component stability; [production architecture](opentelemetry/03_production_architecture.md). |
+| Score provenance | Evidence of which evaluator, rule or annotation produced a score; [evaluation](langfuse/05_evaluation_metrics_alerting.md). |
+| Experiment identity | Stable experiment identifier shared deliberately by resumed or distributed workers, distinct from its display name; [evaluation](langfuse/05_evaluation_metrics_alerting.md). |
